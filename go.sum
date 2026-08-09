@@ -1,3 +1,9 @@
+github.com/Muxcore-Media/core v0.5.0 h1:iW78JWvamIQWw+pjrS0ZDDRXNxWU+vhbs3riOxBWGzg=
+github.com/Muxcore-Media/core v0.5.0/go.mod h1:MG+eFlGf41DIPGHxbT6AGQ8F/g7ct0mCkOQ5YLDNBoI=
+github.com/Muxcore-Media/core/pkg/contracts v0.5.0 h1:1DD8QCzIsAYgz2lmxDPucargBdSe2af/xhHwZpjxNKs=
+github.com/Muxcore-Media/core/pkg/contracts v0.5.0/go.mod h1:gbI+28IlviQlGYYoQj2DJVet/5LXLQtjFeSRo0a+8BI=
+github.com/Muxcore-Media/core/sdk/go/module v0.5.0 h1:6+flrG8eAYppZqGfPFrfHcwBk6yeAkHhAHDkCspJWwo=
+github.com/Muxcore-Media/core/sdk/go/module v0.5.0/go.mod h1:Xrvicm1Nk/2igPJvccxaUxpNorzCgoQevVevDmJ11WA=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
