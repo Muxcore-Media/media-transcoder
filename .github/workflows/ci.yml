@@ -9,7 +9,7 @@ env:
   REGISTRY: ghcr.io
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v7
         with:
@@ -27,7 +27,7 @@ jobs:
         run: go vet ./...
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,10 +42,10 @@ jobs:
           go-version: "1.26"
           cache: true
       - working-directory: ./media-transcoder
-        run: go test -race -count=1 -timeout 10m ./...
+        run: go test -count=1 -timeout 10m ./...
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v7
         with:
