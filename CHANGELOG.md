@@ -1,5 +1,11 @@
 # Changelog
 
+
+## [0.1.3] — 2026-08-10
+
+### Fixed
+- Sync Info()/muxcore.json version to **0.1.3**.
+
 ## v0.1.1 (2026-08-10)
 
 - Harden: default gRPC `:9525` (avoid collision with media-subtitles `:9520`); fix default `h264_fast` container typo (`mkx` → `mkv`)
