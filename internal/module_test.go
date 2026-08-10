@@ -170,11 +170,12 @@ func TestDetectHardware(t *testing.T) {
 }
 
 func TestBuildFFmpegArgs(t *testing.T) {
+	m := NewModule(Config{})
 	profile := &transcodev1.TranscodeProfile{
 		Name: "Test", VideoCodec: "h264", AudioCodec: "copy",
 		Preset: "medium", Crf: 23, Container: "mkv",
 	}
-	args := buildFFmpegArgs(profile, "/in.mkv", "/out.mkv")
+	args := m.buildFFmpegArgs(profile, "/in.mkv", "/out.mkv")
 	if len(args) == 0 {
 		t.Fatal("expected non-empty args")
 	}

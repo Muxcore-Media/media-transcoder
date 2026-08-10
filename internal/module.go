@@ -22,6 +22,7 @@ import (
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
+	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
 	_ "modernc.org/sqlite"
 )
 
@@ -29,18 +30,20 @@ type Module struct {
 	transcodev1.UnimplementedTranscodeServiceServer
 
 	mu     sync.RWMutex
+	cfgMu  sync.RWMutex
 	db     *sql.DB
 	jobsMu sync.Mutex
 	jobs   map[string]*jobState
 	nextID atomic.Int64
 
-	id           string
-	dbPath       string
-	grpcAddr     string
+	id            string
+	dbPath        string
+	grpcAddr      string
+	ffmpegBin     string
 	maxConcurrent int
-	jobSlots     chan struct{}
-	grpcSrv      *grpc.Server
-	grpcLis      net.Listener
+	jobSlots      chan struct{}
+	grpcSrv       *grpc.Server
+	grpcLis       net.Listener
 }
 
 type jobState struct {
@@ -50,9 +53,10 @@ type jobState struct {
 }
 
 type Config struct {
-	ID       string
-	DBPath   string
-	GRPCAddr string
+	ID        string
+	DBPath    string
+	GRPCAddr  string
+	FFmpegBin string
 }
 
 func NewModule(cfg Config) *Module {
@@ -65,11 +69,17 @@ func NewModule(cfg Config) *Module {
 	if cfg.GRPCAddr == "" {
 		cfg.GRPCAddr = ":9525"
 	}
+	if cfg.FFmpegBin == "" {
+		cfg.FFmpegBin = "ffmpeg"
+	}
 	if v := os.Getenv("TRANSCODER_DB_PATH"); v != "" {
 		cfg.DBPath = v
 	}
 	if v := os.Getenv("TRANSCODER_GRPC_ADDR"); v != "" {
 		cfg.GRPCAddr = v
+	}
+	if v := os.Getenv("TRANSCODER_FFMPEG_BIN"); v != "" {
+		cfg.FFmpegBin = v
 	}
 	maxConcurrent := 2
 	if v := strings.TrimSpace(os.Getenv("TRANSCODER_MAX_CONCURRENT")); v != "" {
@@ -85,6 +95,7 @@ func NewModule(cfg Config) *Module {
 		id:            cfg.ID,
 		dbPath:        cfg.DBPath,
 		grpcAddr:      cfg.GRPCAddr,
+		ffmpegBin:     cfg.FFmpegBin,
 		maxConcurrent: maxConcurrent,
 		jobSlots:      slots,
 		jobs:          make(map[string]*jobState),
@@ -95,7 +106,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:      "0.1.3",
+		Version:      "0.1.4",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with GPU acceleration support, queue management, and progress tracking",
 		Author:         "MuxCore",
@@ -199,6 +210,7 @@ func (m *Module) Init(ctx context.Context) error {
 func (m *Module) Start(ctx context.Context) error {
 	m.grpcSrv = grpc.NewServer()
 	transcodev1.RegisterTranscodeServiceServer(m.grpcSrv, m)
+	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
 
 	go func() {
 		slog.Info("media-transcoder gRPC started", "addr", m.grpcAddr)
@@ -241,8 +253,8 @@ func (m *Module) Health(ctx context.Context) error {
 	if err := db.PingContext(ctx); err != nil {
 		return err
 	}
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return fmt.Errorf("ffmpeg not found in PATH")
+	if _, err := exec.LookPath(m.getFFmpegBin()); err != nil {
+		return fmt.Errorf("%s not found in PATH", m.getFFmpegBin())
 	}
 	return nil
 }
@@ -421,14 +433,14 @@ func (m *Module) GetJob(ctx context.Context, req *transcodev1.GetJobRequest) (*t
 func (m *Module) DetectHardware(ctx context.Context, req *transcodev1.DetectHardwareRequest) (*transcodev1.DetectHardwareResponse, error) {
 	var devices []*transcodev1.HardwareDevice
 
-	if hasNVENC() {
+	if m.hasNVENC() {
 		devices = append(devices,
 			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "h264_nvenc"},
 			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "hevc_nvenc"},
 			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "av1_nvenc"},
 		)
 	}
-	if hasVAAPI() {
+	if m.hasVAAPI() {
 		devices = append(devices,
 			&transcodev1.HardwareDevice{Name: "VAAPI", Type: "vaapi", Available: true, Encoder: "h264_vaapi"},
 			&transcodev1.HardwareDevice{Name: "VAAPI", Type: "vaapi", Available: true, Encoder: "hevc_vaapi"},
@@ -439,8 +451,8 @@ func (m *Module) DetectHardware(ctx context.Context, req *transcodev1.DetectHard
 	return &transcodev1.DetectHardwareResponse{Devices: devices}, nil
 }
 
-func hasNVENC() bool {
-	cmd := exec.Command("ffmpeg", "-encoders", "-hide_banner")
+func (m *Module) hasNVENC() bool {
+	cmd := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -448,8 +460,8 @@ func hasNVENC() bool {
 	return strings.Contains(string(out), "nvenc")
 }
 
-func hasVAAPI() bool {
-	cmd := exec.Command("ffmpeg", "-encoders", "-hide_banner")
+func (m *Module) hasVAAPI() bool {
+	cmd := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -491,8 +503,8 @@ func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
 	m.db.Exec(`UPDATE transcode_jobs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
 	m.mu.Unlock()
 
-	args := buildFFmpegArgs(profile, js.info.InputPath, js.info.OutputPath)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	args := m.buildFFmpegArgs(profile, js.info.InputPath, js.info.OutputPath)
+	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -589,10 +601,10 @@ func parseTimeToSec(h, m, s, ms string) float64 {
 	return hh*3600 + mm*60 + ss + mss/100
 }
 
-func buildFFmpegArgs(profile *transcodev1.TranscodeProfile, input, output string) []string {
+func (m *Module) buildFFmpegArgs(profile *transcodev1.TranscodeProfile, input, output string) []string {
 	args := []string{"-i", input, "-y", "-progress", "pipe:1"}
 
-	if profile.GetUseGpu() && hasNVENC() {
+	if profile.GetUseGpu() && m.hasNVENC() {
 		switch profile.GetVideoCodec() {
 		case "hevc":
 			args = append(args, "-c:v", "hevc_nvenc")
