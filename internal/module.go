@@ -34,11 +34,13 @@ type Module struct {
 	jobs   map[string]*jobState
 	nextID atomic.Int64
 
-	id       string
-	dbPath   string
-	grpcAddr string
-	grpcSrv  *grpc.Server
-	grpcLis  net.Listener
+	id           string
+	dbPath       string
+	grpcAddr     string
+	maxConcurrent int
+	jobSlots     chan struct{}
+	grpcSrv      *grpc.Server
+	grpcLis      net.Listener
 }
 
 type jobState struct {
@@ -61,7 +63,7 @@ func NewModule(cfg Config) *Module {
 		cfg.DBPath = "/var/lib/media-transcoder/transcoder.db"
 	}
 	if cfg.GRPCAddr == "" {
-		cfg.GRPCAddr = ":9520"
+		cfg.GRPCAddr = ":9525"
 	}
 	if v := os.Getenv("TRANSCODER_DB_PATH"); v != "" {
 		cfg.DBPath = v
@@ -69,11 +71,23 @@ func NewModule(cfg Config) *Module {
 	if v := os.Getenv("TRANSCODER_GRPC_ADDR"); v != "" {
 		cfg.GRPCAddr = v
 	}
+	maxConcurrent := 2
+	if v := strings.TrimSpace(os.Getenv("TRANSCODER_MAX_CONCURRENT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxConcurrent = n
+		}
+	}
+	slots := make(chan struct{}, maxConcurrent)
+	for i := 0; i < maxConcurrent; i++ {
+		slots <- struct{}{}
+	}
 	return &Module{
-		id:       cfg.ID,
-		dbPath:   cfg.DBPath,
-		grpcAddr: cfg.GRPCAddr,
-		jobs:     make(map[string]*jobState),
+		id:            cfg.ID,
+		dbPath:        cfg.DBPath,
+		grpcAddr:      cfg.GRPCAddr,
+		maxConcurrent: maxConcurrent,
+		jobSlots:      slots,
+		jobs:          make(map[string]*jobState),
 	}
 }
 
@@ -81,11 +95,11 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:        "0.1.0",
+		Version:        "0.1.1",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with GPU acceleration support, queue management, and progress tracking",
 		Author:         "MuxCore",
-		Capabilities:   []string{"media.transcoder", "executor.transcode"},
+		Capabilities:   []string{"media.transcoder", "executor.transcode", "transcoder"},
 		MinCoreVersion: "0.4.0",
 		HTTPAddr:       m.grpcAddr,
 	}
@@ -154,7 +168,7 @@ func (m *Module) Init(ctx context.Context) error {
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO transcode_profiles (id, name, video_codec, audio_codec, preset, crf, container, created_at, updated_at)
-		VALUES ('h264_fast', 'H.264 Fast', 'h264', 'copy', 'fast', 23, 'mkx', ?, ?)
+		VALUES ('h264_fast', 'H.264 Fast', 'h264', 'copy', 'fast', 23, 'mkv', ?, ?)
 	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); err != nil {
 		db.Close()
 		return fmt.Errorf("insert default profile: %w", err)
@@ -224,7 +238,13 @@ func (m *Module) Health(ctx context.Context) error {
 	if db == nil {
 		return fmt.Errorf("not initialized")
 	}
-	return db.PingContext(ctx)
+	if err := db.PingContext(ctx); err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg not found in PATH")
+	}
+	return nil
 }
 
 // ── Profile CRUD ───────────────────────────────────────────────
@@ -440,6 +460,19 @@ func hasVAAPI() bool {
 // ── FFmpeg Execution ───────────────────────────────────────────
 
 func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
+	select {
+	case <-m.jobSlots:
+	case <-time.After(24 * time.Hour):
+		m.jobsMu.Lock()
+		js := m.jobs[jobID]
+		m.jobsMu.Unlock()
+		if js != nil {
+			m.failJob(js, "timed out waiting for job slot")
+		}
+		return
+	}
+	defer func() { m.jobSlots <- struct{}{} }()
+
 	m.jobsMu.Lock()
 	js, ok := m.jobs[jobID]
 	m.jobsMu.Unlock()
