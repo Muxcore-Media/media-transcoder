@@ -106,11 +106,11 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:      "0.1.4",
+		Version:      "0.1.5",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with GPU acceleration support, queue management, and progress tracking",
 		Author:         "MuxCore",
-		Capabilities:   []string{"media.transcoder", "executor.transcode", "transcoder"},
+		Capabilities:   []string{"media.transcoder", "executor.transcode", "transcoder", "settings"},
 		MinCoreVersion: "0.4.0",
 		HTTPAddr:       m.grpcAddr,
 	}

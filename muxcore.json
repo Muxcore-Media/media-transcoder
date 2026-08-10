@@ -1,14 +1,15 @@
 {
   "name": "Media Transcoder",
   "description": "Video transcoding via FFmpeg with GPU acceleration support, queue management, and progress tracking",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "author": "MuxCore",
   "roles": [
     "transcoder"
   ],
   "capabilities": [
     "media.transcoder",
-    "executor.transcode"
+    "executor.transcode",
+    "settings"
   ],
   "contracts": [],
   "minCoreVersion": "0.4.0"
