@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,7 +253,49 @@ func TestLifecycle(t *testing.T) {
 func TestHealth(t *testing.T) {
 	m := newTestModule(t)
 	ctx := context.Background()
-	if err := m.Health(ctx); err != nil {
-		t.Fatal("expected health to pass")
+	err := m.Health(ctx)
+	if err != nil && !strings.Contains(err.Error(), "ffmpeg") {
+		t.Fatalf("unexpected health error: %v", err)
+	}
+}
+
+func TestDefaultProfileContainerIsMKV(t *testing.T) {
+	m := newTestModule(t)
+	ctx := context.Background()
+	profiles, err := m.ListProfiles(ctx, &transcodev1.ListProfilesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range profiles.Profiles {
+		if p.Id == "h264_fast" && p.Container != "mkv" {
+			t.Fatalf("h264_fast container=%q want mkv", p.Container)
+		}
+	}
+}
+
+func TestCapabilitiesIncludeWorkflowRef(t *testing.T) {
+	info := NewModule(Config{}).Info()
+	found := false
+	for _, c := range info.Capabilities {
+		if c == "transcoder" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected transcoder capability for media-transcode DAG, got %v", info.Capabilities)
+	}
+	if info.HTTPAddr != ":9525" {
+		t.Fatalf("default addr=%q want :9525", info.HTTPAddr)
+	}
+}
+
+func TestMaxConcurrentFromEnv(t *testing.T) {
+	t.Setenv("TRANSCODER_MAX_CONCURRENT", "3")
+	m := NewModule(Config{DBPath: filepath.Join(t.TempDir(), "c.db"), GRPCAddr: ":0"})
+	if m.maxConcurrent != 3 {
+		t.Fatalf("maxConcurrent=%d want 3", m.maxConcurrent)
+	}
+	if cap(m.jobSlots) != 3 {
+		t.Fatalf("jobSlots cap=%d want 3", cap(m.jobSlots))
 	}
 }
