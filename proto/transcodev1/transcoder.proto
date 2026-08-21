@@ -13,6 +13,20 @@ service TranscodeService {
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc DetectHardware(DetectHardwareRequest) returns (DetectHardwareResponse);
+
+  // Tdarr-style configurable pipelines (setups / plugin stacks)
+  rpc ListSetups(ListSetupsRequest) returns (ListSetupsResponse);
+  rpc GetSetup(GetSetupRequest) returns (GetSetupResponse);
+  rpc UpsertSetup(UpsertSetupRequest) returns (UpsertSetupResponse);
+  rpc DeleteSetup(DeleteSetupRequest) returns (DeleteSetupResponse);
+  rpc ProcessFile(ProcessFileRequest) returns (ProcessFileResponse);
+  rpc ScanSetups(ScanSetupsRequest) returns (ScanSetupsResponse);
+  rpc ListPipelineRuns(ListPipelineRunsRequest) returns (ListPipelineRunsResponse);
+  rpc GetPipelineRun(GetPipelineRunRequest) returns (GetPipelineRunResponse);
+  rpc ApprovePipelineRun(ApprovePipelineRunRequest) returns (ApprovePipelineRunResponse);
+  rpc RejectPipelineRun(RejectPipelineRunRequest) returns (RejectPipelineRunResponse);
+  rpc ListStepTemplates(ListStepTemplatesRequest) returns (ListStepTemplatesResponse);
+  rpc ApplyStepTemplate(ApplyStepTemplateRequest) returns (ApplyStepTemplateResponse);
 }
 
 // ── Profiles ───────────────────────────────────────────────────
@@ -125,3 +139,132 @@ message HardwareDevice {
   bool available = 3;
   string encoder = 4;   // "h264_nvenc", "hevc_nvenc", etc.
 }
+
+// ── Setups (Tdarr libraries / plugin stacks) ───────────────────
+
+message PipelineStep {
+  string id = 1;
+  string step_type = 2;    // filter.skip_if_codec, filter.min_size_mb, action.remux, ...
+  string config_json = 3;
+  int32 sort_order = 4;
+  bool enabled = 5;
+}
+
+message SetupOutput {
+  string id = 1;
+  string profile_id = 2;
+  string suffix = 3;           // inserted before extension, e.g. "-hevc"
+  bool replace_extension = 4;  // use profile container as extension
+  int32 sort_order = 5;
+  bool enabled = 6;
+}
+
+message TranscodeSetup {
+  string id = 1;
+  string name = 2;
+  bool enabled = 3;
+  repeated string library_paths = 4;  // path prefix match
+  string trigger = 5;               // on_import, manual, scheduled
+  string source_disposition = 6;    // keep, replace, delete, archive
+  string archive_path = 7;          // move original here when disposition=archive
+  repeated SetupOutput outputs = 8;
+  repeated PipelineStep steps = 9;
+  string created_at = 10;
+  string updated_at = 11;
+  bool hold_for_review = 12;  // pause before destructive source disposition
+}
+
+message ListSetupsRequest {}
+message ListSetupsResponse { repeated TranscodeSetup setups = 1; }
+
+message GetSetupRequest { string id = 1; }
+message GetSetupResponse { TranscodeSetup setup = 1; }
+
+message UpsertSetupRequest { TranscodeSetup setup = 1; }
+message UpsertSetupResponse { TranscodeSetup setup = 1; }
+
+message DeleteSetupRequest { string id = 1; }
+message DeleteSetupResponse {}
+
+message ProcessFileRequest {
+  string setup_id = 1;
+  string input_path = 2;
+  bool wait = 3;  // block until pipeline finishes (dev/admin)
+}
+
+message ProcessFileResponse {
+  string run_id = 1;
+  string status = 2;  // queued, running, skipped, completed, failed
+  string message = 3;
+}
+
+message ScanSetupsRequest {
+  string setup_id = 1;  // empty = all enabled setups
+  string root_path = 2; // optional scan root override
+}
+
+message ScanSetupsResponse {
+  int32 files_queued = 1;
+}
+
+message PipelineRunOutput {
+  string output_path = 1;
+  string profile_id = 2;
+  string job_id = 3;
+  string status = 4;
+  string error = 5;
+}
+
+message PipelineRun {
+  string id = 1;
+  string setup_id = 2;
+  string setup_name = 3;
+  string input_path = 4;
+  string status = 5;  // queued, running, skipped, completed, failed
+  string skip_reason = 6;
+  string source_disposition = 7;
+  string error = 8;
+  repeated PipelineRunOutput outputs = 9;
+  string created_at = 10;
+  string completed_at = 11;
+}
+
+message ListPipelineRunsRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+  string status = 3;
+  string setup_id = 4;
+}
+
+message ListPipelineRunsResponse {
+  repeated PipelineRun runs = 1;
+  int32 total = 2;
+  int32 page = 3;
+  int32 page_size = 4;
+}
+
+message GetPipelineRunRequest { string id = 1; }
+message GetPipelineRunResponse { PipelineRun run = 1; }
+
+message ApprovePipelineRunRequest { string id = 1; }
+message ApprovePipelineRunResponse { PipelineRun run = 1; }
+
+message RejectPipelineRunRequest { string id = 1; }
+message RejectPipelineRunResponse { PipelineRun run = 1; }
+
+message StepTemplate {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  repeated PipelineStep steps = 4;
+}
+
+message ListStepTemplatesRequest {}
+message ListStepTemplatesResponse { repeated StepTemplate templates = 1; }
+
+message ApplyStepTemplateRequest {
+  string setup_id = 1;
+  string template_id = 2;
+  bool replace_steps = 3;
+}
+message ApplyStepTemplateResponse { TranscodeSetup setup = 1; }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,18 +24,23 @@ import (
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	"github.com/Muxcore-Media/core/sdk/go/client"
 	_ "modernc.org/sqlite"
 )
 
 type Module struct {
 	transcodev1.UnimplementedTranscodeServiceServer
 
-	mu     sync.RWMutex
-	cfgMu  sync.RWMutex
-	db     *sql.DB
-	jobsMu sync.Mutex
-	jobs   map[string]*jobState
-	nextID atomic.Int64
+	mu         sync.RWMutex
+	cfgMu      sync.RWMutex
+	pipelineMu sync.Mutex
+	db         *sql.DB
+	jobsMu     sync.Mutex
+	jobs       map[string]*jobState
+	pipelineJobs map[string]string
+	mc         *client.Client
+	scanCancel context.CancelFunc
+	nextID     atomic.Int64
 
 	id            string
 	dbPath        string
@@ -44,6 +50,10 @@ type Module struct {
 	jobSlots      chan struct{}
 	grpcSrv       *grpc.Server
 	grpcLis       net.Listener
+	httpAddr      string
+	httpSrv       *http.Server
+	playbackMu    sync.Mutex
+	playbackSlots chan struct{}
 }
 
 type jobState struct {
@@ -99,6 +109,7 @@ func NewModule(cfg Config) *Module {
 		maxConcurrent: maxConcurrent,
 		jobSlots:      slots,
 		jobs:          make(map[string]*jobState),
+		pipelineJobs:  make(map[string]string),
 	}
 }
 
@@ -106,9 +117,9 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:      "0.1.5",
+		Version:      "0.3.2",
 		Roles:          []string{"transcoder"},
-		Description:    "Video transcoding via FFmpeg with GPU acceleration support, queue management, and progress tracking",
+		Description:    "Video transcoding via FFmpeg with Tdarr-style configurable setups, multi-output pipelines, and job queue",
 		Author:         "MuxCore",
 		Capabilities:   []string{"media.transcoder", "executor.transcode", "transcoder", "settings"},
 		MinCoreVersion: "0.4.0",
@@ -191,6 +202,10 @@ func (m *Module) Init(ctx context.Context) error {
 		db.Close()
 		return fmt.Errorf("insert gpu profile: %w", err)
 	}
+	if err := m.ensureSetupTables(ctx, db); err != nil {
+		db.Close()
+		return fmt.Errorf("setup tables: %w", err)
+	}
 
 	m.mu.Lock()
 	m.db = db
@@ -218,10 +233,18 @@ func (m *Module) Start(ctx context.Context) error {
 			slog.Error("media-transcoder gRPC error", "error", err)
 		}
 	}()
+	go m.dialCore(context.Background())
+	scanCtx, scanCancel := context.WithCancel(context.Background())
+	m.scanCancel = scanCancel
+	go m.scheduledScanLoop(scanCtx)
+	m.startPlaybackHTTP()
 	return nil
 }
 
 func (m *Module) Stop(ctx context.Context) error {
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
 	m.jobsMu.Lock()
 	for _, js := range m.jobs {
 		if js.cancel != nil {
@@ -230,8 +253,14 @@ func (m *Module) Stop(ctx context.Context) error {
 	}
 	m.jobsMu.Unlock()
 
+	if m.httpSrv != nil {
+		_ = m.httpSrv.Shutdown(ctx)
+	}
 	if m.grpcSrv != nil {
 		m.grpcSrv.GracefulStop()
+	}
+	if m.mc != nil {
+		m.mc.Close()
 	}
 	m.mu.Lock()
 	if m.db != nil {
@@ -345,6 +374,14 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 	m.jobs[id] = js
 	m.jobsMu.Unlock()
 
+	if m.poolEnabled() {
+		poolJobID, poolErr := m.enqueueViaPool(context.Background(), req, profile)
+		if poolErr == nil {
+			go m.waitForPoolJob(context.Background(), poolJobID, id)
+			return &transcodev1.EnqueueResponse{JobId: id}, nil
+		}
+		slog.Warn("pool enqueue failed, falling back to local worker", "error", poolErr)
+	}
 	go m.runJob(id, profile)
 	return &transcodev1.EnqueueResponse{JobId: id}, nil
 }

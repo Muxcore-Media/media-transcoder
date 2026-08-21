@@ -1,0 +1,72 @@
+[
+  {
+    "id": "skip_hevc",
+    "name": "Skip if already HEVC",
+    "description": "Tdarr-style health skip for H.265/HEVC sources",
+    "steps": [
+      {
+        "step_type": "filter.skip_if_codec",
+        "config_json": "{\"codecs\":[\"hevc\",\"h265\"]}",
+        "sort_order": 0,
+        "enabled": true
+      }
+    ]
+  },
+  {
+    "id": "remux_mp4",
+    "name": "Remux to MP4",
+    "description": "Copy streams into MP4 container before transcode outputs",
+    "steps": [
+      {
+        "step_type": "action.remux",
+        "config_json": "{\"container\":\"mp4\"}",
+        "sort_order": 0,
+        "enabled": true
+      }
+    ]
+  },
+  {
+    "id": "size_safety",
+    "name": "Skip tiny / huge files",
+    "description": "Ignore files under 100 MB or above 50 GB",
+    "steps": [
+      {
+        "step_type": "filter.min_size_mb",
+        "config_json": "{\"min_mb\":100}",
+        "sort_order": 0,
+        "enabled": true
+      },
+      {
+        "step_type": "filter.max_size_mb",
+        "config_json": "{\"max_mb\":50000}",
+        "sort_order": 1,
+        "enabled": true
+      }
+    ]
+  },
+  {
+    "id": "streaming_stack",
+    "name": "Streaming filter stack",
+    "description": "MKV/MP4 only, skip if companion HEVC output exists",
+    "steps": [
+      {
+        "step_type": "filter.extension",
+        "config_json": "{\"extensions\":[\"mkv\",\"mp4\"]}",
+        "sort_order": 0,
+        "enabled": true
+      },
+      {
+        "step_type": "filter.skip_if_output_exists",
+        "config_json": "{\"suffix\":\"-hevc\"}",
+        "sort_order": 1,
+        "enabled": true
+      },
+      {
+        "step_type": "filter.skip_if_codec",
+        "config_json": "{\"codecs\":[\"hevc\",\"h265\"]}",
+        "sort_order": 2,
+        "enabled": true
+      }
+    ]
+  }
+]
