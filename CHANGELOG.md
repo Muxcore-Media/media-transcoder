@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.2] — 2026-08-21
+
+### Added
+
+- **On-the-fly playback transcoding** over HTTP (`TRANSCODER_HTTP_ADDR`, default `:9526`): fragmented MP4 stream for native media-ui playback.
+- Software encoders (`libx264` / `libx265` / `libaom-av1`) and hardware paths (NVENC, VAAPI) with `gpu=auto|software|nvenc|vaapi`.
+- `GET /api/playback/hardware` for encoder introspection.
+- `TRANSCODER_MAX_PLAYBACK` concurrency limit for live sessions.
+
+## [0.3.0] — 2026-08-20
+
+### Added
+
+- **Hold for review** (`hold_for_review` on setups): after transcode completes, destructive source dispositions (`replace`, `delete`, `archive`) pause in `pending_review` until an operator approves or rejects.
+- gRPC `ApprovePipelineRun` / `RejectPipelineRun` — approve applies source disposition; reject removes transcoded outputs and keeps the original.
+- Admin UI review queue on `/transcode` with approve/reject actions.
+
+## [0.2.0] — 2026-08-20
+
+### Added
+
+- Tdarr-style transcode setups: library paths, filter stacks, multi-output pipelines, source disposition, scheduled/on-import processing.
+
 ## [0.1.5] — 2026-08-10
 
 ### Added
