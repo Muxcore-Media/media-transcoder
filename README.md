@@ -1,6 +1,6 @@
 # Media Transcoder
 
-**FFmpeg video transcoding with profile management, job queue, progress tracking, and optional NVIDIA NVENC acceleration.**
+**FFmpeg video transcoding with profile management, job queue, progress tracking, and multi-vendor hardware acceleration (NVENC, VAAPI, QSV, AMF, VideoToolbox).**
 
 MuxCore sidecar module (`media-transcoder`) exposing `muxcore.transcoder.v1.TranscodeService` over gRPC.
 
@@ -12,7 +12,7 @@ MuxCore sidecar module (`media-transcoder`) exposing `muxcore.transcoder.v1.Tran
 Enqueue(input, output, profile) ──→ FFmpeg job ──→ output file
          │                              │
          ├── SQLite profiles + jobs     ├── progress / fps (stderr parse)
-         └── DetectHardware (nvenc/vaapi advertised)
+         └── DetectHardware (NVENC / VAAPI / QSV / AMF / VideoToolbox)
 ```
 
 ### Key Features
@@ -24,9 +24,9 @@ Enqueue(input, output, profile) ──→ FFmpeg job ──→ output file
 - **Library scan** — `ScanSetups` RPC + scheduled loop (`TRANSCODER_SCAN_INTERVAL`, default 6h)
 - **Job queue** — enqueue, cancel, list (paged), get by ID; concurrent slots via `TRANSCODER_MAX_CONCURRENT`
 - **Default profiles** — `h264_fast` (H.264 Fast), `hevc_gpu` (HEVC GPU, max height 1080)
-- **Hardware detection** — reports NVENC / VAAPI encoders when FFmpeg lists them
-- **GPU encode path** — when `use_gpu` and NVENC are available: `h264_nvenc` / `hevc_nvenc` / `av1_nvenc`; otherwise libx264 / libx265 / libaom-av1
-- **On-the-fly playback transcoding** — HTTP `:9526` streams fragmented MP4 to browsers (software libx264/libx265 or hardware NVENC/VAAPI); consumed by `media-ui-app` via BFF proxy, not implemented in the media UI module
+- **Hardware detection** — reports NVENC, VAAPI, QSV, AMF, and VideoToolbox encoders when FFmpeg lists them
+- **GPU encode path** — when `use_gpu` and hardware is available: NVENC / VAAPI / QSV / AMF / VideoToolbox for H.264, HEVC, and AV1 (per-encoder availability); otherwise libx264 / libx265 / libaom-av1
+- **On-the-fly playback transcoding** — HTTP `:9526` streams fragmented MP4 to browsers (software or any detected hardware backend); consumed by `media-ui-app` via BFF proxy, not implemented in the media UI module
 - **Workflow** — capability `transcoder` for seeded `media-transcode` DAG (with `media-ffprobe`)
 
 ---
@@ -40,6 +40,7 @@ Enqueue(input, output, profile) ──→ FFmpeg job ──→ output file
 | `TRANSCODER_HTTP_ADDR` | `:9526` | Playback transcode HTTP listen address |
 | `TRANSCODER_MAX_PLAYBACK` | `4` | Max simultaneous on-the-fly playback transcode sessions |
 | `TRANSCODER_VAAPI_DEVICE` | `/dev/dri/renderD128` | VAAPI render node for hardware playback encode |
+| `TRANSCODER_QSV_DEVICE` | same as VAAPI device | Intel QSV render node (`-init_hw_device qsv=hw@…`) |
 | `TRANSCODER_MAX_CONCURRENT` | `2` | Max simultaneous FFmpeg jobs |
 | `MUXCORE_GRPC_ADDR` | — | Core mesh address (optional) |
 | `MUXCORE_INSECURE_DISABLE_TLS` | `false` | Disable TLS for local/dev mesh |
@@ -86,7 +87,7 @@ Query parameters on the transcoder endpoint:
 |-------|-------------|
 | `src` | Required. Absolute file path or `http(s)` URL to the source media |
 | `profile` | Transcode profile id (default `h264_fast`) |
-| `gpu` | `auto`, `software`, `nvenc`, or `vaapi` |
+| `gpu` | `auto`, `software`, `nvenc`, `vaapi`, `qsv`, `amf`, or `videotoolbox` |
 
 Hardware introspection: `GET /api/playback/hardware`
 
