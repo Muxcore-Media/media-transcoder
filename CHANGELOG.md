@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.3] — 2026-08-21
+
+### Added
+
+- **Full hardware encode support** for on-the-fly playback and offline jobs: NVENC, VAAPI, Intel QSV, AMD AMF, and Apple VideoToolbox.
+- H.264, HEVC, and AV1 encoder selection per backend based on FFmpeg `-encoders` detection (AV1 only when the backend encoder is present).
+- Platform-aware auto backend priority (e.g. VideoToolbox first on macOS, QSV/AMF prioritized on Windows).
+- `TRANSCODER_QSV_DEVICE` for Intel QSV render node configuration.
+- Playback `gpu` query values: `qsv`, `amf`, `videotoolbox` (plus existing `auto`, `software`, `nvenc`, `vaapi`).
+
+### Changed
+
+- Offline batch jobs now use the same hardware backend selection as playback (not NVENC-only).
+
 ## [0.3.2] — 2026-08-21
 
 ### Added
