@@ -34,7 +34,7 @@ func (m *Module) ApprovePipelineRun(ctx context.Context, req *transcodev1.Approv
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	run, err := m.loadPipelineRun(runID)
+	run, err := m.loadPipelineRun(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +44,7 @@ func (m *Module) ApprovePipelineRun(ctx context.Context, req *transcodev1.Approv
 	if run.GetStatus() != "pending_review" {
 		return nil, fmt.Errorf("run is not pending review (status=%s)", run.GetStatus())
 	}
-	setup, err := m.loadSetup(run.GetSetupId())
+	setup, err := m.loadSetup(ctx, run.GetSetupId())
 	if err != nil {
 		return nil, err
 	}
@@ -52,11 +52,11 @@ func (m *Module) ApprovePipelineRun(ctx context.Context, req *transcodev1.Approv
 		return nil, fmt.Errorf("setup not found: %s", run.GetSetupId())
 	}
 	if err := m.applySourceDisposition(run.GetInputPath(), setup); err != nil {
-		m.updatePipelineRunStatus(runID, "failed", "", err.Error())
+		m.updatePipelineRunStatus(ctx, runID, "failed", "", err.Error())
 		return nil, err
 	}
-	m.updatePipelineRunStatus(runID, "completed", "", "")
-	run, _ = m.loadPipelineRun(runID)
+	m.updatePipelineRunStatus(ctx, runID, "completed", "", "")
+	run, _ = m.loadPipelineRun(ctx, runID)
 	return &transcodev1.ApprovePipelineRunResponse{Run: run}, nil
 }
 
@@ -68,7 +68,7 @@ func (m *Module) RejectPipelineRun(ctx context.Context, req *transcodev1.RejectP
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	run, err := m.loadPipelineRun(runID)
+	run, err := m.loadPipelineRun(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -79,11 +79,11 @@ func (m *Module) RejectPipelineRun(ctx context.Context, req *transcodev1.RejectP
 		return nil, fmt.Errorf("run is not pending review (status=%s)", run.GetStatus())
 	}
 	if err := m.removePipelineOutputs(run); err != nil {
-		m.updatePipelineRunStatus(runID, "failed", "", err.Error())
+		m.updatePipelineRunStatus(ctx, runID, "failed", "", err.Error())
 		return nil, err
 	}
-	m.updatePipelineRunStatus(runID, "rejected", "operator rejected review", "")
-	run, _ = m.loadPipelineRun(runID)
+	m.updatePipelineRunStatus(ctx, runID, "rejected", "operator rejected review", "")
+	run, _ = m.loadPipelineRun(ctx, runID)
 	return &transcodev1.RejectPipelineRunResponse{Run: run}, nil
 }
 
@@ -100,9 +100,9 @@ func (m *Module) removePipelineOutputs(run *transcodev1.PipelineRun) error {
 	return nil
 }
 
-func (m *Module) updatePipelineRunStatus(runID, status, skipReason, errMsg string) {
+func (m *Module) updatePipelineRunStatus(ctx context.Context, runID, status, skipReason, errMsg string) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, _ = m.db.Exec(`
+	_, _ = m.db.ExecContext(ctx, `
 		UPDATE transcode_pipeline_runs SET status = ?, skip_reason = ?, error = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
 		status, skipReason, errMsg, now, now, runID)
 }

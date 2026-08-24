@@ -111,13 +111,13 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	encoderMode := parseStreamEncoderMode(r.URL.Query().Get("gpu"))
 	startSeconds := 0.0
 	if raw := strings.TrimSpace(r.URL.Query().Get("start")); raw != "" {
-		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 {
+		if v, parseErr := strconv.ParseFloat(raw, 64); parseErr == nil && v > 0 {
 			startSeconds = v
 		}
 	}
 	audioStreamIndex := -1
 	if raw := strings.TrimSpace(r.URL.Query().Get("audio_index")); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+		if v, parseErr := strconv.Atoi(raw); parseErr == nil && v >= 0 {
 			audioStreamIndex = v
 		}
 	}
@@ -125,7 +125,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	m.ensurePlaybackSlots()
 
 	m.mu.RLock()
-	profile := m.loadProfile(profileID)
+	profile := m.loadProfile(r.Context(), profileID)
 	m.mu.RUnlock()
 	if profile == nil {
 		http.Error(w, "profile not found", http.StatusBadRequest)
@@ -143,7 +143,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 				Preset:     profile.GetPreset(),
 				Crf:        profile.GetCrf(),
 				MaxWidth:   0,
-				MaxHeight:  int32(h),
+				MaxHeight:  int32(h), //nolint:gosec // query param capped by operator-controlled player UI
 				UseGpu:     profile.GetUseGpu(),
 				Container:  profile.GetContainer(),
 			}
@@ -165,7 +165,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...)
+	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		http.Error(w, "stream pipe error", http.StatusInternalServerError)

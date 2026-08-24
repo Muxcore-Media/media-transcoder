@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -23,39 +22,36 @@ import (
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
-	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
 	"github.com/Muxcore-Media/core/sdk/go/client"
+	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
 	_ "modernc.org/sqlite"
 )
 
 type Module struct {
 	transcodev1.UnimplementedTranscodeServiceServer
-
-	mu         sync.RWMutex
-	cfgMu      sync.RWMutex
-	pipelineMu sync.Mutex
-	db         *sql.DB
-	jobsMu     sync.Mutex
-	jobs       map[string]*jobState
-	pipelineJobs map[string]string
-	mc         *client.Client
-	scanCancel context.CancelFunc
-	nextID     atomic.Int64
-
-	id            string
-	dbPath        string
-	grpcAddr      string
-	ffmpegBin     string
-	maxConcurrent int
-	jobSlots      chan struct{}
-	grpcSrv       *grpc.Server
 	grpcLis       net.Listener
-	httpAddr      string
+	jobs          map[string]*jobState
 	httpSrv       *http.Server
-	playbackMu    sync.Mutex
+	db            *sql.DB
+	jobSlots      chan struct{}
 	playbackSlots chan struct{}
-	hwOnce        sync.Once
+	pipelineJobs  map[string]string
+	mc            *client.Client
+	scanCancel    context.CancelFunc
+	grpcSrv       *grpc.Server
+	id            string
+	grpcAddr      string
+	dbPath        string
+	ffmpegBin     string
+	httpAddr      string
 	hwEncoders    string
+	maxConcurrent int
+	mu            sync.RWMutex
+	cfgMu         sync.RWMutex
+	hwOnce        sync.Once
+	pipelineMu    sync.Mutex
+	playbackMu    sync.Mutex
+	jobsMu        sync.Mutex
 }
 
 type jobState struct {
@@ -119,7 +115,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:      "0.3.3",
+		Version:        "0.3.3",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with Tdarr-style configurable setups, multi-output pipelines, and job queue",
 		Author:         "MuxCore",
@@ -131,7 +127,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 
 func (m *Module) Init(ctx context.Context) error {
 	dir := filepath.Dir(m.dbPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create db dir: %w", err)
 	}
 
@@ -141,11 +137,12 @@ func (m *Module) Init(ctx context.Context) error {
 	}
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
-		db.Close()
-		return fmt.Errorf("enable WAL: %w", err)
+	closeDB := func() { _ = db.Close() }
+	if _, execErr := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); execErr != nil {
+		closeDB()
+		return fmt.Errorf("enable WAL: %w", execErr)
 	}
-	if _, err := db.ExecContext(ctx, `
+	if _, execErr := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS transcode_profiles (
 			id         TEXT PRIMARY KEY,
 			name       TEXT NOT NULL UNIQUE,
@@ -160,11 +157,11 @@ func (m *Module) Init(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)
-	`); err != nil {
-		db.Close()
-		return fmt.Errorf("create profiles table: %w", err)
+	`); execErr != nil {
+		closeDB()
+		return fmt.Errorf("create profiles table: %w", execErr)
 	}
-	if _, err := db.ExecContext(ctx, `
+	if _, execErr := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS transcode_jobs (
 			id           TEXT PRIMARY KEY,
 			input_path   TEXT NOT NULL,
@@ -180,42 +177,43 @@ func (m *Module) Init(ctx context.Context) error {
 			created_at   TEXT NOT NULL,
 			updated_at   TEXT NOT NULL
 		)
-	`); err != nil {
-		db.Close()
-		return fmt.Errorf("create jobs table: %w", err)
+	`); execErr != nil {
+		closeDB()
+		return fmt.Errorf("create jobs table: %w", execErr)
 	}
-	if _, err := db.ExecContext(ctx, `
+	if _, execErr := db.ExecContext(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_jobs_status ON transcode_jobs(status)
-	`); err != nil {
-		db.Close()
-		return fmt.Errorf("create index: %w", err)
+	`); execErr != nil {
+		closeDB()
+		return fmt.Errorf("create index: %w", execErr)
 	}
-	if _, err := db.ExecContext(ctx, `
+	if _, execErr := db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO transcode_profiles (id, name, video_codec, audio_codec, preset, crf, container, created_at, updated_at)
 		VALUES ('h264_fast', 'H.264 Fast', 'h264', 'copy', 'fast', 23, 'mkv', ?, ?)
-	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); err != nil {
-		db.Close()
-		return fmt.Errorf("insert default profile: %w", err)
+	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); execErr != nil {
+		closeDB()
+		return fmt.Errorf("insert default profile: %w", execErr)
 	}
-	if _, err := db.ExecContext(ctx, `
+	if _, execErr := db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO transcode_profiles (id, name, video_codec, audio_codec, preset, crf, max_height, use_gpu, container, created_at, updated_at)
 		VALUES ('hevc_gpu', 'HEVC GPU', 'hevc', 'copy', 'medium', 28, 1080, 1, 'mkv', ?, ?)
-	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); err != nil {
-		db.Close()
-		return fmt.Errorf("insert gpu profile: %w", err)
+	`, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); execErr != nil {
+		closeDB()
+		return fmt.Errorf("insert gpu profile: %w", execErr)
 	}
-	if err := m.ensureSetupTables(ctx, db); err != nil {
-		db.Close()
-		return fmt.Errorf("setup tables: %w", err)
+	if setupErr := m.ensureSetupTables(ctx, db); setupErr != nil {
+		closeDB()
+		return fmt.Errorf("setup tables: %w", setupErr)
 	}
 
 	m.mu.Lock()
 	m.db = db
 	m.mu.Unlock()
 
-	lis, err := net.Listen("tcp", m.grpcAddr)
+	lc := net.ListenConfig{}
+	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
 	if err != nil {
-		db.Close()
+		closeDB()
 		return fmt.Errorf("listen gRPC: %w", err)
 	}
 	m.grpcLis = lis
@@ -235,8 +233,8 @@ func (m *Module) Start(ctx context.Context) error {
 			slog.Error("media-transcoder gRPC error", "error", err)
 		}
 	}()
-	go m.dialCore(context.Background())
-	scanCtx, scanCancel := context.WithCancel(context.Background())
+	go m.dialCore(context.Background()) //nolint:gosec // module lifecycle goroutine outlives request context
+	scanCtx, scanCancel := context.WithCancel(ctx)
 	m.scanCancel = scanCancel
 	go m.scheduledScanLoop(scanCtx)
 	m.startPlaybackHTTP()
@@ -262,11 +260,11 @@ func (m *Module) Stop(ctx context.Context) error {
 		m.grpcSrv.GracefulStop()
 	}
 	if m.mc != nil {
-		m.mc.Close()
+		_ = m.mc.Close()
 	}
 	m.mu.Lock()
 	if m.db != nil {
-		m.db.Close()
+		_ = m.db.Close()
 		m.db = nil
 	}
 	m.mu.Unlock()
@@ -295,7 +293,7 @@ func (m *Module) Health(ctx context.Context) error {
 func (m *Module) ListProfiles(ctx context.Context, req *transcodev1.ListProfilesRequest) (*transcodev1.ListProfilesResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return &transcodev1.ListProfilesResponse{Profiles: m.loadProfiles()}, nil
+	return &transcodev1.ListProfilesResponse{Profiles: m.loadProfiles(ctx)}, nil
 }
 
 func (m *Module) CreateProfile(ctx context.Context, req *transcodev1.CreateProfileRequest) (*transcodev1.CreateProfileResponse, error) {
@@ -304,14 +302,14 @@ func (m *Module) CreateProfile(ctx context.Context, req *transcodev1.CreateProfi
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	id := fmt.Sprintf("tp_%d", time.Now().UnixNano())
-	_, err := m.db.Exec(`INSERT INTO transcode_profiles (id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := m.db.ExecContext(ctx, `INSERT INTO transcode_profiles (id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, req.GetName(), req.GetVideoCodec(), req.GetAudioCodec(), req.GetPreset(),
 		req.GetCrf(), req.GetMaxWidth(), req.GetMaxHeight(), boolToInt(req.GetUseGpu()),
 		req.GetContainer(), now, now)
 	if err != nil {
 		return nil, fmt.Errorf("create profile: %w", err)
 	}
-	return &transcodev1.CreateProfileResponse{Profile: m.loadProfile(id)}, nil
+	return &transcodev1.CreateProfileResponse{Profile: m.loadProfile(ctx, id)}, nil
 }
 
 func (m *Module) UpdateProfile(ctx context.Context, req *transcodev1.UpdateProfileRequest) (*transcodev1.UpdateProfileResponse, error) {
@@ -319,14 +317,14 @@ func (m *Module) UpdateProfile(ctx context.Context, req *transcodev1.UpdateProfi
 	defer m.mu.Unlock()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := m.db.Exec(`UPDATE transcode_profiles SET name=?, video_codec=?, audio_codec=?, preset=?, crf=?, max_width=?, max_height=?, use_gpu=?, container=?, updated_at=? WHERE id=?`,
+	_, err := m.db.ExecContext(ctx, `UPDATE transcode_profiles SET name=?, video_codec=?, audio_codec=?, preset=?, crf=?, max_width=?, max_height=?, use_gpu=?, container=?, updated_at=? WHERE id=?`,
 		req.GetName(), req.GetVideoCodec(), req.GetAudioCodec(), req.GetPreset(),
 		req.GetCrf(), req.GetMaxWidth(), req.GetMaxHeight(), boolToInt(req.GetUseGpu()),
 		req.GetContainer(), now, req.GetId())
 	if err != nil {
 		return nil, fmt.Errorf("update profile: %w", err)
 	}
-	p := m.loadProfile(req.GetId())
+	p := m.loadProfile(ctx, req.GetId())
 	if p == nil {
 		return nil, fmt.Errorf("profile not found")
 	}
@@ -336,7 +334,7 @@ func (m *Module) UpdateProfile(ctx context.Context, req *transcodev1.UpdateProfi
 func (m *Module) DeleteProfile(ctx context.Context, req *transcodev1.DeleteProfileRequest) (*transcodev1.DeleteProfileResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.db.Exec(`DELETE FROM transcode_profiles WHERE id = ?`, req.GetId())
+	_, _ = m.db.ExecContext(ctx, `DELETE FROM transcode_profiles WHERE id = ?`, req.GetId())
 	return &transcodev1.DeleteProfileResponse{}, nil
 }
 
@@ -351,7 +349,7 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 	}
 
 	m.mu.RLock()
-	profile := m.loadProfile(req.GetProfileId())
+	profile := m.loadProfile(ctx, req.GetProfileId())
 	m.mu.RUnlock()
 	if profile == nil {
 		return nil, fmt.Errorf("profile not found: %s", req.GetProfileId())
@@ -361,7 +359,7 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 	id := fmt.Sprintf("tj_%d", time.Now().UnixNano())
 
 	m.mu.Lock()
-	m.db.Exec(`INSERT INTO transcode_jobs (id, input_path, output_path, profile_id, profile_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
+	_, _ = m.db.ExecContext(ctx, `INSERT INTO transcode_jobs (id, input_path, output_path, profile_id, profile_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
 		id, req.GetInputPath(), req.GetOutputPath(), profile.GetId(), profile.GetName(), now, now)
 	m.mu.Unlock()
 
@@ -379,12 +377,12 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 	if m.poolEnabled() {
 		poolJobID, poolErr := m.enqueueViaPool(context.Background(), req, profile)
 		if poolErr == nil {
-			go m.waitForPoolJob(context.Background(), poolJobID, id)
+			go m.waitForPoolJob(ctx, poolJobID, id)
 			return &transcodev1.EnqueueResponse{JobId: id}, nil
 		}
 		slog.Warn("pool enqueue failed, falling back to local worker", "error", poolErr)
 	}
-	go m.runJob(id, profile)
+	go m.runJob(ctx, id, profile) //nolint:gosec // transcode worker outlives enqueue RPC
 	return &transcodev1.EnqueueResponse{JobId: id}, nil
 }
 
@@ -399,7 +397,7 @@ func (m *Module) CancelJob(ctx context.Context, req *transcodev1.CancelJobReques
 		js.cancel()
 	}
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'cancelled', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), req.GetJobId())
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'cancelled', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), req.GetJobId())
 	m.mu.Unlock()
 	return &transcodev1.CancelJobResponse{}, nil
 }
@@ -429,21 +427,24 @@ func (m *Module) ListJobs(ctx context.Context, req *transcodev1.ListJobsRequest)
 		args = append(args, filter)
 	}
 	if len(where) > 0 {
-		clause := ` WHERE ` + strings.Join(where, ` AND `)
+		clause := ` WHERE ` + strings.Join(where, ` AND `) //nolint:gosec // clause is built from fixed fragments; values are bound
+		//nolint:gosec // values are bound; only static WHERE fragments are concatenated
 		query += clause
 		countQuery += clause
 	}
 
 	var total int
-	m.db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err := m.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count jobs: %w", err)
+	}
 	query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
-	qargs := append(args, pageSize, offset)
+	qargs := append(append([]any{}, args...), pageSize, offset)
 
 	rows, err := m.db.QueryContext(ctx, query, qargs...)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []*transcodev1.TranscodeJob
 	for rows.Next() {
@@ -452,14 +453,16 @@ func (m *Module) ListJobs(ctx context.Context, req *transcodev1.ListJobsRequest)
 			jobs = append(jobs, j)
 		}
 	}
-	return &transcodev1.ListJobsResponse{Jobs: jobs, Total: int32(total), Page: int32(page), PageSize: int32(pageSize)}, nil
+	return &transcodev1.ListJobsResponse{
+		Jobs: jobs, Total: int32(total), Page: int32(page), PageSize: int32(pageSize), //nolint:gosec // pagination bounds are capped above
+	}, nil
 }
 
 func (m *Module) GetJob(ctx context.Context, req *transcodev1.GetJobRequest) (*transcodev1.GetJobResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	row := m.db.QueryRow(`SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, error, started_at, completed_at, created_at, updated_at FROM transcode_jobs WHERE id = ?`, req.GetJobId())
+	row := m.db.QueryRowContext(ctx, `SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, error, started_at, completed_at, created_at, updated_at FROM transcode_jobs WHERE id = ?`, req.GetJobId())
 	job := scanJobRow(row)
 	if job == nil {
 		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
@@ -477,7 +480,7 @@ func (m *Module) DetectHardware(ctx context.Context, req *transcodev1.DetectHard
 
 // ── FFmpeg Execution ───────────────────────────────────────────
 
-func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
+func (m *Module) runJob(ctx context.Context, jobID string, profile *transcodev1.TranscodeProfile) {
 	select {
 	case <-m.jobSlots:
 	case <-time.After(24 * time.Hour):
@@ -485,7 +488,7 @@ func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
 		js := m.jobs[jobID]
 		m.jobsMu.Unlock()
 		if js != nil {
-			m.failJob(js, "timed out waiting for job slot")
+			m.failJob(ctx, js, "timed out waiting for job slot")
 		}
 		return
 	}
@@ -498,7 +501,7 @@ func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	js.cancel = cancel
 	js.running = true
 	js.info.Status = "running"
@@ -506,20 +509,20 @@ func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
 	js.info.StartedAt = now
 
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
 	m.mu.Unlock()
 
 	args := m.buildFFmpegArgs(profile, js.info.InputPath, js.info.OutputPath)
-	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...)
+	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		m.failJob(js, fmt.Sprintf("pipe error: %v", err))
+		m.failJob(ctx, js, fmt.Sprintf("pipe error: %v", err))
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
-		m.failJob(js, fmt.Sprintf("start error: %v", err))
+	if startErr := cmd.Start(); startErr != nil {
+		m.failJob(ctx, js, fmt.Sprintf("start error: %v", startErr))
 		return
 	}
 
@@ -527,14 +530,14 @@ func (m *Module) runJob(jobID string, profile *transcodev1.TranscodeProfile) {
 	err = cmd.Wait()
 	if err != nil {
 		if ctx.Err() != nil {
-			m.failJob(js, "cancelled")
+			m.failJob(ctx, js, "cancelled")
 		} else {
-			m.failJob(js, fmt.Sprintf("ffmpeg error: %v", err))
+			m.failJob(ctx, js, fmt.Sprintf("ffmpeg error: %v", err))
 		}
 		return
 	}
 
-	m.completeJob(js)
+	m.completeJob(ctx, js)
 }
 
 func (m *Module) monitorProgress(js *jobState, stderr ioReadCloser) {
@@ -569,7 +572,7 @@ func (m *Module) monitorProgress(js *jobState, stderr ioReadCloser) {
 	}
 }
 
-func (m *Module) failJob(js *jobState, errMsg string) {
+func (m *Module) failJob(ctx context.Context, js *jobState, errMsg string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	js.info.Status = "failed"
 	js.info.Error = errMsg
@@ -578,13 +581,13 @@ func (m *Module) failJob(js *jobState, errMsg string) {
 	js.running = false
 
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ?`, errMsg, now, now, js.info.Id)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ?`, errMsg, now, now, js.info.Id)
 	m.mu.Unlock()
 
 	slog.Error("transcode failed", "job", js.info.Id, "error", errMsg)
 }
 
-func (m *Module) completeJob(js *jobState) {
+func (m *Module) completeJob(ctx context.Context, js *jobState) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	js.info.Status = "completed"
 	js.info.Progress = 1.0
@@ -593,7 +596,7 @@ func (m *Module) completeJob(js *jobState) {
 	js.running = false
 
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'completed', progress = 1.0, completed_at = ?, updated_at = ? WHERE id = ?`, now, now, js.info.Id)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'completed', progress = 1.0, completed_at = ?, updated_at = ? WHERE id = ?`, now, now, js.info.Id)
 	m.mu.Unlock()
 
 	slog.Info("transcode completed", "job", js.info.Id, "output", js.info.OutputPath)
@@ -609,12 +612,12 @@ func parseTimeToSec(h, m, s, ms string) float64 {
 
 // ── DB Load Helpers ────────────────────────────────────────────
 
-func (m *Module) loadProfiles() []*transcodev1.TranscodeProfile {
-	rows, err := m.db.Query(`SELECT id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at FROM transcode_profiles ORDER BY name`)
+func (m *Module) loadProfiles(ctx context.Context) []*transcodev1.TranscodeProfile {
+	rows, err := m.db.QueryContext(ctx, `SELECT id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at FROM transcode_profiles ORDER BY name`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var profiles []*transcodev1.TranscodeProfile
 	for rows.Next() {
 		p := scanProfile(rows)
@@ -625,8 +628,8 @@ func (m *Module) loadProfiles() []*transcodev1.TranscodeProfile {
 	return profiles
 }
 
-func (m *Module) loadProfile(id string) *transcodev1.TranscodeProfile {
-	row := m.db.QueryRow(`SELECT id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at FROM transcode_profiles WHERE id = ?`, id)
+func (m *Module) loadProfile(ctx context.Context, id string) *transcodev1.TranscodeProfile {
+	row := m.db.QueryRowContext(ctx, `SELECT id, name, video_codec, audio_codec, preset, crf, max_width, max_height, use_gpu, container, created_at, updated_at FROM transcode_profiles WHERE id = ?`, id)
 	return scanProfileRow(row)
 }
 
@@ -639,7 +642,7 @@ func scanProfile(rows *sql.Rows) *transcodev1.TranscodeProfile {
 	}
 	return &transcodev1.TranscodeProfile{
 		Id: id, Name: name, VideoCodec: vcodec, AudioCodec: acodec,
-		Preset: preset, Crf: int32(crf), MaxWidth: int32(maxW), MaxHeight: int32(maxH),
+		Preset: preset, Crf: int32(crf), MaxWidth: int32(maxW), MaxHeight: int32(maxH), //nolint:gosec // profile dimensions stored in SQLite fit int32
 		UseGpu: useGPU != 0, Container: container, CreatedAt: createdAt, UpdatedAt: updatedAt,
 	}
 }
@@ -653,7 +656,7 @@ func scanProfileRow(row *sql.Row) *transcodev1.TranscodeProfile {
 	}
 	return &transcodev1.TranscodeProfile{
 		Id: id, Name: name, VideoCodec: vcodec, AudioCodec: acodec,
-		Preset: preset, Crf: int32(crf), MaxWidth: int32(maxW), MaxHeight: int32(maxH),
+		Preset: preset, Crf: int32(crf), MaxWidth: int32(maxW), MaxHeight: int32(maxH), //nolint:gosec // profile dimensions stored in SQLite fit int32
 		UseGpu: useGPU != 0, Container: container, CreatedAt: createdAt, UpdatedAt: updatedAt,
 	}
 }

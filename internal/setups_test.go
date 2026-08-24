@@ -97,7 +97,7 @@ func TestMatchSetupsForPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.mu.RLock()
-	matched, err := m.matchSetupsForPath("/data/movies/Fight Club/Fight.Club.mkv")
+	matched, err := m.matchSetupsForPath(context.Background(), "/data/movies/Fight Club/Fight.Club.mkv")
 	m.mu.RUnlock()
 	if err != nil {
 		t.Fatal(err)

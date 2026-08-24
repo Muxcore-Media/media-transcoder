@@ -80,7 +80,7 @@ func (m *Module) ApplyStepTemplate(ctx context.Context, req *transcodev1.ApplySt
 	}
 
 	m.mu.RLock()
-	setup, err := m.loadSetup(setupID)
+	setup, err := m.loadSetup(ctx, setupID)
 	m.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -91,7 +91,7 @@ func (m *Module) ApplyStepTemplate(ctx context.Context, req *transcodev1.ApplySt
 	if req.GetReplaceSteps() {
 		setup.Steps = nil
 	}
-	base := int32(len(setup.GetSteps()))
+	base := int32(len(setup.GetSteps())) //nolint:gosec // step count bounded by setup editor
 	for i, step := range picked.GetSteps() {
 		if step == nil {
 			continue

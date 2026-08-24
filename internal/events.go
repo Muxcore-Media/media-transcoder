@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/Muxcore-Media/core/pkg/contracts"
-	"github.com/Muxcore-Media/core/sdk/go/client"
 	eventsv1 "github.com/Muxcore-Media/core/proto/gen/muxcore/events/v1"
+	"github.com/Muxcore-Media/core/sdk/go/client"
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 )
 
@@ -31,10 +31,10 @@ func (m *Module) dialCore(ctx context.Context) {
 	}
 	m.mc = c
 	slog.Info("media-transcoder: connected to core mesh", "addr", meshAddr)
-	m.subscribeLibraryEvents()
+	m.subscribeLibraryEvents(ctx)
 }
 
-func (m *Module) subscribeLibraryEvents() {
+func (m *Module) subscribeLibraryEvents(ctx context.Context) {
 	if m.mc == nil {
 		return
 	}
@@ -44,17 +44,17 @@ func (m *Module) subscribeLibraryEvents() {
 		contracts.EventFileImported,
 	}
 	for _, et := range types {
-		ch, cancel, err := m.mc.Events.Subscribe(context.Background(), et)
+		ch, cancel, err := m.mc.Events.Subscribe(ctx, et)
 		if err != nil {
 			slog.Warn("media-transcoder: subscribe", "type", et, "error", err)
 			continue
 		}
-		go m.handleEventStream(et, ch, cancel)
+		go m.handleEventStream(ctx, et, ch, cancel)
 		slog.Info("media-transcoder: subscribed", "type", et)
 	}
 }
 
-func (m *Module) handleEventStream(eventType string, ch <-chan *eventsv1.Event, cancel context.CancelFunc) {
+func (m *Module) handleEventStream(ctx context.Context, eventType string, ch <-chan *eventsv1.Event, cancel context.CancelFunc) {
 	defer cancel()
 	for evt := range ch {
 		path := eventFilePath(eventType, evt.GetPayload())
@@ -65,7 +65,7 @@ func (m *Module) handleEventStream(eventType string, ch <-chan *eventsv1.Event, 
 			continue
 		}
 		m.mu.RLock()
-		setups, err := m.matchSetupsForPath(path)
+		setups, err := m.matchSetupsForPath(ctx, path)
 		m.mu.RUnlock()
 		if err != nil {
 			continue
@@ -74,10 +74,10 @@ func (m *Module) handleEventStream(eventType string, ch <-chan *eventsv1.Event, 
 			if setup.GetTrigger() != "on_import" {
 				continue
 			}
-			if m.hasCompletedRun(setup.GetId(), path) {
+			if m.hasCompletedRun(ctx, setup.GetId(), path) {
 				continue
 			}
-			_, _, _, err := m.startPipelineRun(setup, path)
+			_, _, _, err := m.startPipelineRun(ctx, setup, path)
 			if err != nil {
 				slog.Warn("auto pipeline", "setup", setup.GetId(), "path", path, "error", err)
 			}
@@ -123,8 +123,8 @@ func (m *Module) scheduledScanLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-			_, err := m.ScanSetups(scanCtx, &transcodev1.ScanSetupsRequest{})
+			scanRunCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+			_, err := m.ScanSetups(scanRunCtx, &transcodev1.ScanSetupsRequest{})
 			cancel()
 			if err != nil {
 				slog.Warn("scheduled scan", "error", err)
