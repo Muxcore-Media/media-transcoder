@@ -84,7 +84,7 @@ func (m *Module) handleTrickplaySprite(w http.ResponseWriter, r *http.Request) {
 
 	key := trickplayCacheKey(input, interval)
 	dir := m.trickplayDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		http.Error(w, "trickplay cache dir: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -145,7 +145,7 @@ func (m *Module) generateTrickplaySprite(input, outPath string, sprite trickplay
 		"-q:v", "4",
 		"-y", tmp,
 	}
-	cmd := exec.Command(m.getFFmpegBin(), args...)
+	cmd := exec.Command(m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.Remove(tmp)

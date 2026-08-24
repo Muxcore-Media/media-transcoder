@@ -112,7 +112,7 @@ func (m *Module) seedDefaultSetup(ctx context.Context, db *sql.DB) error {
 func (m *Module) ListSetups(ctx context.Context, _ *transcodev1.ListSetupsRequest) (*transcodev1.ListSetupsResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	setups, err := m.loadAllSetups()
+	setups, err := m.loadAllSetups(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func (m *Module) ListSetups(ctx context.Context, _ *transcodev1.ListSetupsReques
 func (m *Module) GetSetup(ctx context.Context, req *transcodev1.GetSetupRequest) (*transcodev1.GetSetupResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	setup, err := m.loadSetup(req.GetId())
+	setup, err := m.loadSetup(ctx, req.GetId())
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +156,7 @@ func (m *Module) UpsertSetup(ctx context.Context, req *transcodev1.UpsertSetupRe
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var exists int
 	_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM transcode_setups WHERE id = ?`, id).Scan(&exists)
@@ -217,10 +217,10 @@ func (m *Module) UpsertSetup(ctx context.Context, req *transcodev1.UpsertSetupRe
 			return nil, err
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
+	if commitErr := tx.Commit(); commitErr != nil {
+		return nil, commitErr
 	}
-	setup, err := m.loadSetup(id)
+	setup, err := m.loadSetup(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -240,24 +240,24 @@ func (m *Module) DeleteSetup(ctx context.Context, req *transcodev1.DeleteSetupRe
 	return &transcodev1.DeleteSetupResponse{}, nil
 }
 
-func (m *Module) loadAllSetups() ([]*transcodev1.TranscodeSetup, error) {
-	rows, err := m.db.Query(`SELECT id FROM transcode_setups ORDER BY name`)
+func (m *Module) loadAllSetups(ctx context.Context) ([]*transcodev1.TranscodeSetup, error) {
+	rows, err := m.db.QueryContext(ctx, `SELECT id FROM transcode_setups ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			_ = rows.Close()
+			return nil, scanErr
 		}
 		ids = append(ids, id)
 	}
-	rows.Close()
+	_ = rows.Close()
 	var setups []*transcodev1.TranscodeSetup
 	for _, id := range ids {
-		s, err := m.loadSetup(id)
+		s, err := m.loadSetup(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -268,8 +268,8 @@ func (m *Module) loadAllSetups() ([]*transcodev1.TranscodeSetup, error) {
 	return setups, nil
 }
 
-func (m *Module) loadSetup(id string) (*transcodev1.TranscodeSetup, error) {
-	row := m.db.QueryRow(`
+func (m *Module) loadSetup(ctx context.Context, id string) (*transcodev1.TranscodeSetup, error) {
+	row := m.db.QueryRowContext(ctx, `
 		SELECT id, name, enabled, library_paths, trigger_mode, source_disposition, archive_path, hold_for_review, created_at, updated_at
 		FROM transcode_setups WHERE id = ?`, id)
 	var setup transcodev1.TranscodeSetup
@@ -286,7 +286,7 @@ func (m *Module) loadSetup(id string) (*transcodev1.TranscodeSetup, error) {
 	setup.HoldForReview = hold != 0
 	_ = json.Unmarshal([]byte(pathsJSON), &setup.LibraryPaths)
 
-	outRows, err := m.db.Query(`
+	outRows, err := m.db.QueryContext(ctx, `
 		SELECT id, profile_id, suffix, replace_extension, sort_order, enabled
 		FROM transcode_setup_outputs WHERE setup_id = ? ORDER BY sort_order, id`, id)
 	if err != nil {
@@ -295,39 +295,37 @@ func (m *Module) loadSetup(id string) (*transcodev1.TranscodeSetup, error) {
 	for outRows.Next() {
 		var o transcodev1.SetupOutput
 		var rep, en int
-		if err := outRows.Scan(&o.Id, &o.ProfileId, &o.Suffix, &rep, &o.SortOrder, &en); err != nil {
-			outRows.Close()
-			return nil, err
+		if scanErr := outRows.Scan(&o.Id, &o.ProfileId, &o.Suffix, &rep, &o.SortOrder, &en); scanErr != nil {
+			_ = outRows.Close()
+			return nil, scanErr
 		}
 		o.ReplaceExtension = rep != 0
 		o.Enabled = en != 0
 		setup.Outputs = append(setup.Outputs, &o)
 	}
-	outRows.Close()
+	_ = outRows.Close()
 
-	stepRows, err := m.db.Query(`
+	stepRows, err := m.db.QueryContext(ctx, `
 		SELECT id, step_type, config_json, sort_order, enabled
 		FROM transcode_setup_steps WHERE setup_id = ? ORDER BY sort_order, id`, id)
 	if err != nil {
 		return nil, err
 	}
-	defer stepRows.Close()
+	defer func() { _ = stepRows.Close() }()
 	for stepRows.Next() {
 		var s transcodev1.PipelineStep
 		var en int
-		if err := stepRows.Scan(&s.Id, &s.StepType, &s.ConfigJson, &s.SortOrder, &en); err != nil {
-			stepRows.Close()
-			return nil, err
+		if scanErr := stepRows.Scan(&s.Id, &s.StepType, &s.ConfigJson, &s.SortOrder, &en); scanErr != nil {
+			return nil, scanErr
 		}
 		s.Enabled = en != 0
 		setup.Steps = append(setup.Steps, &s)
 	}
-	stepRows.Close()
 	return &setup, nil
 }
 
-func (m *Module) matchSetupsForPath(path string) ([]*transcodev1.TranscodeSetup, error) {
-	all, err := m.loadAllSetups()
+func (m *Module) matchSetupsForPath(ctx context.Context, path string) ([]*transcodev1.TranscodeSetup, error) {
+	all, err := m.loadAllSetups(ctx)
 	if err != nil {
 		return nil, err
 	}
