@@ -91,6 +91,7 @@ func indexOf(args []string, want string) int {
 
 func TestBuildPlaybackStreamArgsNVENC(t *testing.T) {
 	m := NewModule(Config{})
+	m.hwEncoders = "hevc_nvenc"
 	profile := &transcodev1.TranscodeProfile{
 		VideoCodec: "hevc",
 		Preset:     "medium",

@@ -25,7 +25,7 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 	}
 
 	m.mu.RLock()
-	setup, err := m.loadSetup(setupID)
+	setup, err := m.loadSetup(ctx, setupID)
 	m.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -34,7 +34,7 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 		return nil, fmt.Errorf("setup not found: %s", setupID)
 	}
 
-	runID, status, msg, err := m.startPipelineRun(setup, input)
+	runID, status, msg, err := m.startPipelineRun(ctx, setup, input)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 			return nil, err
 		}
 		m.mu.RLock()
-		run, _ := m.loadPipelineRun(runID)
+		run, _ := m.loadPipelineRun(ctx, runID)
 		m.mu.RUnlock()
 		if run != nil {
 			status = run.GetStatus()
@@ -59,7 +59,7 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 
 func (m *Module) ScanSetups(ctx context.Context, req *transcodev1.ScanSetupsRequest) (*transcodev1.ScanSetupsResponse, error) {
 	m.mu.RLock()
-	setups, err := m.loadAllSetups()
+	setups, err := m.loadAllSetups(ctx)
 	m.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -86,21 +86,27 @@ func (m *Module) ScanSetups(ctx context.Context, req *transcodev1.ScanSetupsRequ
 			if root == "" {
 				continue
 			}
-			_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
-				if walkErr != nil || d.IsDir() {
+			walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if d.IsDir() {
 					return nil
 				}
 				if !isVideoFile(path) {
 					return nil
 				}
-				if m.hasCompletedRun(setup.GetId(), path) {
+				if m.hasCompletedRun(ctx, setup.GetId(), path) {
 					return nil
 				}
-				if _, _, _, err := m.startPipelineRun(setup, path); err == nil {
+				if _, _, _, err := m.startPipelineRun(ctx, setup, path); err == nil {
 					queued++
 				}
 				return nil
 			})
+			if walkErr != nil {
+				slog.Warn("scan walk", "root", root, "error", walkErr)
+			}
 		}
 	}
 	return &transcodev1.ScanSetupsResponse{FilesQueued: int32(queued)}, nil
@@ -132,7 +138,8 @@ func (m *Module) ListPipelineRuns(ctx context.Context, req *transcodev1.ListPipe
 		args = append(args, sid)
 	}
 	if len(where) > 0 {
-		clause := ` WHERE ` + strings.Join(where, ` AND `)
+		clause := ` WHERE ` + strings.Join(where, ` AND `) //nolint:gosec // clause is built from fixed fragments; values are bound
+		//nolint:gosec // values are bound; only static WHERE fragments are concatenated
 		query += clause
 		countQuery += clause
 	}
@@ -144,14 +151,14 @@ func (m *Module) ListPipelineRuns(ctx context.Context, req *transcodev1.ListPipe
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var runs []*transcodev1.PipelineRun
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		run, err := m.loadPipelineRun(id)
+		run, err := m.loadPipelineRun(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -160,14 +167,14 @@ func (m *Module) ListPipelineRuns(ctx context.Context, req *transcodev1.ListPipe
 		}
 	}
 	return &transcodev1.ListPipelineRunsResponse{
-		Runs: runs, Total: int32(total), Page: int32(page), PageSize: int32(pageSize),
+		Runs: runs, Total: int32(total), Page: int32(page), PageSize: int32(pageSize), //nolint:gosec // pagination bounds are capped above
 	}, nil
 }
 
 func (m *Module) GetPipelineRun(ctx context.Context, req *transcodev1.GetPipelineRunRequest) (*transcodev1.GetPipelineRunResponse, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	run, err := m.loadPipelineRun(req.GetId())
+	run, err := m.loadPipelineRun(ctx, req.GetId())
 	if err != nil {
 		return nil, err
 	}
@@ -177,13 +184,13 @@ func (m *Module) GetPipelineRun(ctx context.Context, req *transcodev1.GetPipelin
 	return &transcodev1.GetPipelineRunResponse{Run: run}, nil
 }
 
-func (m *Module) startPipelineRun(setup *transcodev1.TranscodeSetup, inputPath string) (runID, status, msg string, err error) {
+func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.TranscodeSetup, inputPath string) (runID, status, msg string, err error) {
 	inputPath = filepathClean(inputPath)
 	now := time.Now().UTC().Format(time.RFC3339)
 	runID = fmt.Sprintf("pr_%d", time.Now().UnixNano())
 
 	m.mu.Lock()
-	_, err = m.db.Exec(`
+	_, err = m.db.ExecContext(ctx, `
 		INSERT INTO transcode_pipeline_runs (id, setup_id, setup_name, input_path, status, source_disposition, created_at, updated_at)
 		VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
 		runID, setup.GetId(), setup.GetName(), inputPath, setup.GetSourceDisposition(), now, now)
@@ -192,25 +199,24 @@ func (m *Module) startPipelineRun(setup *transcodev1.TranscodeSetup, inputPath s
 		return "", "", "", err
 	}
 
-	go m.executePipelineRun(runID, setup, inputPath)
+	go m.executePipelineRun(ctx, runID, setup, inputPath)
 	return runID, "queued", "pipeline started", nil
 }
 
-func (m *Module) executePipelineRun(runID string, setup *transcodev1.TranscodeSetup, inputPath string) {
-	ctx := context.Background()
+func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *transcodev1.TranscodeSetup, inputPath string) {
 	skipReason, err := m.evaluatePipelineFilters(inputPath, setup.GetSteps())
 	if err != nil {
-		m.finishPipelineRun(runID, "failed", "", err.Error())
+		m.finishPipelineRun(ctx, runID, "failed", "", err.Error())
 		return
 	}
 	if skipReason != "" {
-		m.finishPipelineRun(runID, "skipped", skipReason, "")
+		m.finishPipelineRun(ctx, runID, "skipped", skipReason, "")
 		return
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_pipeline_runs SET status = 'running', updated_at = ? WHERE id = ?`, now, runID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_pipeline_runs SET status = 'running', updated_at = ? WHERE id = ?`, now, runID)
 	m.mu.Unlock()
 
 	var pendingJobs []string
@@ -218,19 +224,19 @@ func (m *Module) executePipelineRun(runID string, setup *transcodev1.TranscodeSe
 		if !out.GetEnabled() {
 			continue
 		}
-		profile := m.loadProfileLocked(out.GetProfileId())
+		profile := m.loadProfileLocked(ctx, out.GetProfileId())
 		if profile == nil {
-			m.finishPipelineRun(runID, "failed", "", fmt.Sprintf("profile not found: %s", out.GetProfileId()))
+			m.finishPipelineRun(ctx, runID, "failed", "", fmt.Sprintf("profile not found: %s", out.GetProfileId()))
 			return
 		}
 		outputPath := computeOutputPath(inputPath, out, profile)
 		if outputPath == inputPath {
-			m.finishPipelineRun(runID, "failed", "", "output path equals input path")
+			m.finishPipelineRun(ctx, runID, "failed", "", "output path equals input path")
 			return
 		}
 		outID := fmt.Sprintf("po_%d", time.Now().UnixNano())
 		m.mu.Lock()
-		m.db.Exec(`
+		_, _ = m.db.ExecContext(ctx, `
 			INSERT INTO transcode_pipeline_outputs (id, run_id, output_path, profile_id, status)
 			VALUES (?, ?, ?, ?, 'queued')`, outID, runID, outputPath, out.GetProfileId())
 		m.mu.Unlock()
@@ -242,27 +248,27 @@ func (m *Module) executePipelineRun(runID string, setup *transcodev1.TranscodeSe
 		})
 		if err != nil {
 			m.mu.Lock()
-			m.db.Exec(`UPDATE transcode_pipeline_outputs SET status = 'failed', error = ? WHERE id = ?`, err.Error(), outID)
+			_, _ = m.db.ExecContext(ctx, `UPDATE transcode_pipeline_outputs SET status = 'failed', error = ? WHERE id = ?`, err.Error(), outID)
 			m.mu.Unlock()
-			m.finishPipelineRun(runID, "failed", "", err.Error())
+			m.finishPipelineRun(ctx, runID, "failed", "", err.Error())
 			return
 		}
 		jobID := resp.GetJobId()
 		m.mu.Lock()
-		m.db.Exec(`UPDATE transcode_pipeline_outputs SET job_id = ?, status = 'running' WHERE id = ?`, jobID, outID)
+		_, _ = m.db.ExecContext(ctx, `UPDATE transcode_pipeline_outputs SET job_id = ?, status = 'running' WHERE id = ?`, jobID, outID)
 		m.mu.Unlock()
 		m.trackPipelineJob(runID, jobID)
 		pendingJobs = append(pendingJobs, jobID)
 	}
 
 	if len(pendingJobs) == 0 {
-		m.finishPipelineRun(runID, "failed", "", "no enabled outputs")
+		m.finishPipelineRun(ctx, runID, "failed", "", "no enabled outputs")
 		return
 	}
-	m.waitForJobsAndFinalize(runID, setup, inputPath, pendingJobs)
+	m.waitForJobsAndFinalize(ctx, runID, setup, inputPath, pendingJobs)
 }
 
-func (m *Module) waitForJobsAndFinalize(runID string, setup *transcodev1.TranscodeSetup, inputPath string, jobIDs []string) {
+func (m *Module) waitForJobsAndFinalize(ctx context.Context, runID string, setup *transcodev1.TranscodeSetup, inputPath string, jobIDs []string) {
 	deadline := time.Now().Add(48 * time.Hour)
 	for time.Now().Before(deadline) {
 		allDone := true
@@ -270,7 +276,7 @@ func (m *Module) waitForJobsAndFinalize(runID string, setup *transcodev1.Transco
 		failMsg := ""
 		for _, jobID := range jobIDs {
 			m.mu.RLock()
-			row := m.db.QueryRow(`SELECT status, error FROM transcode_jobs WHERE id = ?`, jobID)
+			row := m.db.QueryRowContext(ctx, `SELECT status, error FROM transcode_jobs WHERE id = ?`, jobID)
 			var st, errMsg string
 			_ = row.Scan(&st, &errMsg)
 			m.mu.RUnlock()
@@ -287,24 +293,24 @@ func (m *Module) waitForJobsAndFinalize(runID string, setup *transcodev1.Transco
 			}
 		}
 		if anyFailed {
-			m.finishPipelineRun(runID, "failed", "", failMsg)
+			m.finishPipelineRun(ctx, runID, "failed", "", failMsg)
 			return
 		}
 		if allDone {
 			if needsHoldForReview(setup) {
-				m.finishPipelineRun(runID, "pending_review", "", "")
+				m.finishPipelineRun(ctx, runID, "pending_review", "", "")
 				return
 			}
 			if err := m.applySourceDisposition(inputPath, setup); err != nil {
-				m.finishPipelineRun(runID, "failed", "", err.Error())
+				m.finishPipelineRun(ctx, runID, "failed", "", err.Error())
 				return
 			}
-			m.finishPipelineRun(runID, "completed", "", "")
+			m.finishPipelineRun(ctx, runID, "completed", "", "")
 			return
 		}
 		time.Sleep(2 * time.Second)
 	}
-	m.finishPipelineRun(runID, "failed", "", "timed out waiting for transcode jobs")
+	m.finishPipelineRun(ctx, runID, "failed", "", "timed out waiting for transcode jobs")
 }
 
 func (m *Module) waitForPipelineRun(ctx context.Context, runID string) error {
@@ -316,7 +322,7 @@ func (m *Module) waitForPipelineRun(ctx context.Context, runID string) error {
 			return ctx.Err()
 		case <-ticker.C:
 			m.mu.RLock()
-			run, _ := m.loadPipelineRun(runID)
+			run, _ := m.loadPipelineRun(ctx, runID)
 			m.mu.RUnlock()
 			if run == nil {
 				return fmt.Errorf("run not found")
@@ -329,10 +335,10 @@ func (m *Module) waitForPipelineRun(ctx context.Context, runID string) error {
 	}
 }
 
-func (m *Module) finishPipelineRun(runID, status, skipReason, errMsg string) {
+func (m *Module) finishPipelineRun(ctx context.Context, runID, status, skipReason, errMsg string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	m.mu.Lock()
-	m.db.Exec(`
+	_, _ = m.db.ExecContext(ctx, `
 		UPDATE transcode_pipeline_runs SET status = ?, skip_reason = ?, error = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
 		status, skipReason, errMsg, now, now, runID)
 	m.mu.Unlock()
@@ -360,10 +366,10 @@ func (m *Module) evaluatePipelineFilters(inputPath string, steps []*transcodev1.
 }
 
 type probeInfo struct {
-	VideoCodec  string
-	Container   string
-	SizeBytes   int64
-	Extension   string
+	VideoCodec string
+	Container  string
+	Extension  string
+	SizeBytes  int64
 }
 
 func (m *Module) evalStep(inputPath string, info *probeInfo, step *transcodev1.PipelineStep) (skip bool, reason string, err error) {
@@ -423,9 +429,9 @@ func (m *Module) remuxContainer(inputPath, container string) error {
 	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
 	tmp := filepath.Join(dir, base+".remux."+container)
 	args := []string{"-i", inputPath, "-c", "copy", "-y", tmp}
-	cmd := exec.Command(m.getFFmpegBin(), args...)
+	cmd := exec.Command(m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("remux: %v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("remux: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, base+"."+container)); err != nil {
 		_ = os.Remove(tmp)
@@ -449,7 +455,7 @@ func (m *Module) probeFile(path string) (*probeInfo, error) {
 		Extension: ext,
 	}
 	args := []string{"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1", path}
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.Command("ffprobe", args...) //nolint:gosec // ffprobe reads operator-controlled media paths
 	out, err := cmd.Output()
 	if err == nil {
 		line := strings.TrimSpace(string(out))
@@ -471,7 +477,7 @@ func (m *Module) applySourceDisposition(inputPath string, setup *transcodev1.Tra
 		if archiveDir == "" {
 			return fmt.Errorf("archive_path required for archive disposition")
 		}
-		if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		if err := os.MkdirAll(archiveDir, 0o750); err != nil {
 			return err
 		}
 		dest := filepath.Join(archiveDir, filepath.Base(inputPath))
@@ -503,8 +509,8 @@ func computeOutputPath(input string, out *transcodev1.SetupOutput, profile *tran
 	return filepath.Join(dir, name+suffix+ext)
 }
 
-func (m *Module) loadPipelineRun(id string) (*transcodev1.PipelineRun, error) {
-	row := m.db.QueryRow(`
+func (m *Module) loadPipelineRun(ctx context.Context, id string) (*transcodev1.PipelineRun, error) {
+	row := m.db.QueryRowContext(ctx, `
 		SELECT id, setup_id, setup_name, input_path, status, skip_reason, source_disposition, error, created_at, completed_at
 		FROM transcode_pipeline_runs WHERE id = ?`, id)
 	var run transcodev1.PipelineRun
@@ -512,12 +518,12 @@ func (m *Module) loadPipelineRun(id string) (*transcodev1.PipelineRun, error) {
 		&run.SkipReason, &run.SourceDisposition, &run.Error, &run.CreatedAt, &run.CompletedAt); err != nil {
 		return nil, err
 	}
-	outRows, err := m.db.Query(`
+	outRows, err := m.db.QueryContext(ctx, `
 		SELECT output_path, profile_id, job_id, status, error FROM transcode_pipeline_outputs WHERE run_id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
-	defer outRows.Close()
+	defer func() { _ = outRows.Close() }()
 	for outRows.Next() {
 		var o transcodev1.PipelineRunOutput
 		if err := outRows.Scan(&o.OutputPath, &o.ProfileId, &o.JobId, &o.Status, &o.Error); err != nil {
@@ -528,19 +534,19 @@ func (m *Module) loadPipelineRun(id string) (*transcodev1.PipelineRun, error) {
 	return &run, nil
 }
 
-func (m *Module) hasCompletedRun(setupID, inputPath string) bool {
+func (m *Module) hasCompletedRun(ctx context.Context, setupID, inputPath string) bool {
 	var n int
-	_ = m.db.QueryRow(`
+	_ = m.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM transcode_pipeline_runs
 		WHERE setup_id = ? AND input_path = ? AND status IN ('completed', 'skipped', 'pending_review')`,
 		setupID, filepathClean(inputPath)).Scan(&n)
 	return n > 0
 }
 
-func (m *Module) loadProfileLocked(id string) *transcodev1.TranscodeProfile {
+func (m *Module) loadProfileLocked(ctx context.Context, id string) *transcodev1.TranscodeProfile {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.loadProfile(id)
+	return m.loadProfile(ctx, id)
 }
 
 func (m *Module) trackPipelineJob(runID, jobID string) {
