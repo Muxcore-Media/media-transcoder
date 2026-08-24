@@ -49,7 +49,7 @@ func (m *Module) enqueueViaPool(ctx context.Context, req *transcodev1.EnqueueReq
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	client := transcoderpoolv1.NewTranscoderPoolServiceClient(conn)
 	resp, err := client.Enqueue(ctx, &transcoderpoolv1.EnqueueRequest{
 		InputPath:  req.GetInputPath(),
@@ -69,64 +69,64 @@ func (m *Module) enqueueViaPool(ctx context.Context, req *transcodev1.EnqueueReq
 func (m *Module) waitForPoolJob(ctx context.Context, poolJobID, localJobID string) {
 	addr, err := m.poolAddr(ctx)
 	if err != nil {
-		m.markPoolJobFailed(localJobID, err.Error())
+		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		m.markPoolJobFailed(localJobID, err.Error())
+		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	client := transcoderpoolv1.NewTranscoderPoolServiceClient(conn)
 
 	deadline := time.Now().Add(48 * time.Hour)
 	for time.Now().Before(deadline) {
 		resp, err := client.GetJob(ctx, &transcoderpoolv1.GetJobRequest{Id: poolJobID})
 		if err != nil {
-			m.markPoolJobFailed(localJobID, err.Error())
+			m.markPoolJobFailed(ctx, localJobID, err.Error())
 			return
 		}
 		job := resp.GetJob()
 		if job == nil {
-			m.markPoolJobFailed(localJobID, "pool job missing")
+			m.markPoolJobFailed(ctx, localJobID, "pool job missing")
 			return
 		}
 		switch job.GetStatus() {
 		case "done":
-			m.markPoolJobComplete(localJobID)
+			m.markPoolJobComplete(ctx, localJobID)
 			return
 		case "failed", "cancelled":
 			msg := job.GetError()
 			if msg == "" {
 				msg = job.GetStatus()
 			}
-			m.markPoolJobFailed(localJobID, msg)
+			m.markPoolJobFailed(ctx, localJobID, msg)
 			return
 		case "running", "assigned":
-			m.markPoolJobProgress(localJobID, 0.5)
+			m.markPoolJobProgress(ctx, localJobID, 0.5)
 		}
 		time.Sleep(2 * time.Second)
 	}
-	m.markPoolJobFailed(localJobID, "timed out waiting for pool job")
+	m.markPoolJobFailed(ctx, localJobID, "timed out waiting for pool job")
 }
 
-func (m *Module) markPoolJobComplete(jobID string) {
+func (m *Module) markPoolJobComplete(ctx context.Context, jobID string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'completed', progress = 1, completed_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'completed', progress = 1, completed_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
 	m.mu.Unlock()
 }
 
-func (m *Module) markPoolJobFailed(jobID, msg string) {
+func (m *Module) markPoolJobFailed(ctx context.Context, jobID, msg string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ?`, msg, now, now, jobID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ?`, msg, now, now, jobID)
 	m.mu.Unlock()
 }
 
-func (m *Module) markPoolJobProgress(jobID string, progress float64) {
+func (m *Module) markPoolJobProgress(ctx context.Context, jobID string, progress float64) {
 	m.mu.Lock()
-	m.db.Exec(`UPDATE transcode_jobs SET status = 'running', progress = ?, updated_at = ? WHERE id = ?`, progress, time.Now().UTC().Format(time.RFC3339), jobID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'running', progress = ?, updated_at = ? WHERE id = ?`, progress, time.Now().UTC().Format(time.RFC3339), jobID)
 	m.mu.Unlock()
 }

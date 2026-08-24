@@ -35,9 +35,9 @@ const (
 type hwCodecMap map[string]string
 
 type hwBackendSpec struct {
+	Codecs      hwCodecMap
 	Type        string
 	DisplayName string
-	Codecs      hwCodecMap
 }
 
 var hwBackendCatalog = []hwBackendSpec{
@@ -89,7 +89,7 @@ func parseStreamEncoderMode(raw string) hwBackend {
 
 func (m *Module) ffmpegEncoders() string {
 	m.hwOnce.Do(func() {
-		out, err := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner").Output()
+		out, err := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner").Output() //nolint:gosec // ffmpeg binary path is operator-configured
 		if err == nil {
 			m.hwEncoders = string(out)
 		}
@@ -103,19 +103,6 @@ func (m *Module) hasEncoder(name string) bool {
 		return false
 	}
 	return strings.Contains(m.ffmpegEncoders(), name)
-}
-
-func (m *Module) backendAvailable(backend hwBackend) bool {
-	spec, ok := hwBackendByType(string(backend))
-	if !ok {
-		return false
-	}
-	for _, enc := range spec.Codecs {
-		if m.hasEncoder(enc) {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Module) backendSupportsCodec(backend hwBackend, videoCodec string) bool {

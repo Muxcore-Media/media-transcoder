@@ -28,7 +28,7 @@ func resolveStreamInput(src string) (string, error) {
 	if !filepath.IsAbs(src) {
 		return "", fmt.Errorf("src must be an absolute path or http(s) url")
 	}
-	st, err := os.Stat(src)
+	st, err := os.Stat(src) //nolint:gosec // src is validated as absolute path or http(s) URL before stat
 	if err != nil {
 		return "", fmt.Errorf("src not accessible: %w", err)
 	}
