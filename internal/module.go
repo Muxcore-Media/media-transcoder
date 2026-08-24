@@ -54,6 +54,8 @@ type Module struct {
 	httpSrv       *http.Server
 	playbackMu    sync.Mutex
 	playbackSlots chan struct{}
+	hwOnce        sync.Once
+	hwEncoders    string
 }
 
 type jobState struct {
@@ -117,7 +119,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:      "0.3.2",
+		Version:      "0.3.3",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with Tdarr-style configurable setups, multi-output pipelines, and job queue",
 		Author:         "MuxCore",
@@ -468,42 +470,9 @@ func (m *Module) GetJob(ctx context.Context, req *transcodev1.GetJobRequest) (*t
 // ── Hardware Detection ─────────────────────────────────────────
 
 func (m *Module) DetectHardware(ctx context.Context, req *transcodev1.DetectHardwareRequest) (*transcodev1.DetectHardwareResponse, error) {
-	var devices []*transcodev1.HardwareDevice
-
-	if m.hasNVENC() {
-		devices = append(devices,
-			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "h264_nvenc"},
-			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "hevc_nvenc"},
-			&transcodev1.HardwareDevice{Name: "NVIDIA GPU", Type: "nvenc", Available: true, Encoder: "av1_nvenc"},
-		)
-	}
-	if m.hasVAAPI() {
-		devices = append(devices,
-			&transcodev1.HardwareDevice{Name: "VAAPI", Type: "vaapi", Available: true, Encoder: "h264_vaapi"},
-			&transcodev1.HardwareDevice{Name: "VAAPI", Type: "vaapi", Available: true, Encoder: "hevc_vaapi"},
-		)
-	}
-
+	devices := m.detectHardwareDevices()
 	slog.Info("hardware detection", "devices", len(devices))
 	return &transcodev1.DetectHardwareResponse{Devices: devices}, nil
-}
-
-func (m *Module) hasNVENC() bool {
-	cmd := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), "nvenc")
-}
-
-func (m *Module) hasVAAPI() bool {
-	cmd := exec.Command(m.getFFmpegBin(), "-encoders", "-hide_banner")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(out), "vaapi")
 }
 
 // ── FFmpeg Execution ───────────────────────────────────────────
@@ -636,74 +605,6 @@ func parseTimeToSec(h, m, s, ms string) float64 {
 	ss, _ := strconv.ParseFloat(s, 64)
 	mss, _ := strconv.ParseFloat(ms, 64)
 	return hh*3600 + mm*60 + ss + mss/100
-}
-
-func (m *Module) buildFFmpegArgs(profile *transcodev1.TranscodeProfile, input, output string) []string {
-	args := []string{"-i", input, "-y", "-progress", "pipe:1"}
-
-	if profile.GetUseGpu() && m.hasNVENC() {
-		switch profile.GetVideoCodec() {
-		case "hevc":
-			args = append(args, "-c:v", "hevc_nvenc")
-		case "av1":
-			args = append(args, "-c:v", "av1_nvenc")
-		default:
-			args = append(args, "-c:v", "h264_nvenc")
-		}
-		args = append(args, "-preset", nvencPreset(profile.GetPreset()))
-		if profile.GetCrf() > 0 {
-			args = append(args, "-cq", strconv.Itoa(int(profile.GetCrf())))
-		}
-	} else {
-		switch profile.GetVideoCodec() {
-		case "hevc":
-			args = append(args, "-c:v", "libx265")
-		case "av1":
-			args = append(args, "-c:v", "libaom-av1")
-		default:
-			args = append(args, "-c:v", "libx264")
-		}
-		args = append(args, "-preset", profile.GetPreset())
-		if profile.GetCrf() > 0 {
-			args = append(args, "-crf", strconv.Itoa(int(profile.GetCrf())))
-		}
-	}
-
-	if profile.GetMaxWidth() > 0 || profile.GetMaxHeight() > 0 {
-		filter := fmt.Sprintf("scale='min(%d,iw)':min'(%d,ih)':force_original_aspect_ratio=decrease", profile.GetMaxWidth(), profile.GetMaxHeight())
-		if profile.GetMaxWidth() == 0 {
-			filter = fmt.Sprintf("scale='iw':min'(%d,ih)':force_original_aspect_ratio=decrease", profile.GetMaxHeight())
-		}
-		if profile.GetMaxHeight() == 0 {
-			filter = fmt.Sprintf("scale='min'(%d,iw)':ih':force_original_aspect_ratio=decrease", profile.GetMaxWidth())
-		}
-		args = append(args, "-vf", filter)
-	}
-
-	audioCodec := profile.GetAudioCodec()
-	if audioCodec == "" || audioCodec == "copy" {
-		args = append(args, "-c:a", "copy")
-	} else {
-		args = append(args, "-c:a", audioCodec)
-	}
-
-	args = append(args, output)
-	return args
-}
-
-func nvencPreset(preset string) string {
-	switch preset {
-	case "fast":
-		return "p1"
-	case "medium":
-		return "p4"
-	case "slow":
-		return "p6"
-	case "veryslow":
-		return "p7"
-	default:
-		return "p4"
-	}
 }
 
 // ── DB Load Helpers ────────────────────────────────────────────

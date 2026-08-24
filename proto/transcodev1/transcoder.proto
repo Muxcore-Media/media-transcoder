@@ -135,7 +135,7 @@ message DetectHardwareResponse {
 
 message HardwareDevice {
   string name = 1;
-  string type = 2;      // "nvenc", "vaapi", "qsv", "videotoolbox"
+  string type = 2;      // "nvenc", "vaapi", "qsv", "amf", "videotoolbox"
   bool available = 3;
   string encoder = 4;   // "h264_nvenc", "hevc_nvenc", etc.
 }

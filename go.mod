@@ -3,10 +3,10 @@ module github.com/Muxcore-Media/media-transcoder
 go 1.26.5
 
 require (
-	github.com/Muxcore-Media/core v0.5.4
-	github.com/Muxcore-Media/core/pkg/contracts v0.5.4
-	github.com/Muxcore-Media/core/sdk/go/client v0.5.2
-	github.com/Muxcore-Media/core/sdk/go/module v0.5.2
+	github.com/Muxcore-Media/core v0.5.8
+	github.com/Muxcore-Media/core/pkg/contracts v0.5.8
+	github.com/Muxcore-Media/core/sdk/go/client v0.5.8
+	github.com/Muxcore-Media/core/sdk/go/module v0.5.8
 	github.com/Muxcore-Media/media-transcoder-pool v0.2.0
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.11
@@ -27,9 +27,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-
-
-
 
 replace github.com/Muxcore-Media/media-transcoder-pool => ../media-transcoder-pool

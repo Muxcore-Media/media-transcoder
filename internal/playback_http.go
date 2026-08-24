@@ -61,6 +61,7 @@ func (m *Module) startPlaybackHTTP() {
 	})
 	mux.HandleFunc("GET /stream/transcode", m.handlePlaybackStream)
 	mux.HandleFunc("GET /api/playback/hardware", m.handlePlaybackHardware)
+	mux.HandleFunc("GET /stream/trickplay", m.handleTrickplaySprite)
 
 	m.httpSrv = &http.Server{
 		Addr:              addr,
@@ -108,6 +109,18 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 		profileID = "h264_fast"
 	}
 	encoderMode := parseStreamEncoderMode(r.URL.Query().Get("gpu"))
+	startSeconds := 0.0
+	if raw := strings.TrimSpace(r.URL.Query().Get("start")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 {
+			startSeconds = v
+		}
+	}
+	audioStreamIndex := -1
+	if raw := strings.TrimSpace(r.URL.Query().Get("audio_index")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			audioStreamIndex = v
+		}
+	}
 
 	m.ensurePlaybackSlots()
 
@@ -117,6 +130,24 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	if profile == nil {
 		http.Error(w, "profile not found", http.StatusBadRequest)
 		return
+	}
+	// Manual quality selection (player "Quality" menu): cap output height
+	// without needing a dedicated profile per resolution.
+	if raw := strings.TrimSpace(r.URL.Query().Get("max_height")); raw != "" {
+		if h, hErr := strconv.Atoi(raw); hErr == nil && h > 0 {
+			profile = &transcodev1.TranscodeProfile{
+				Id:         profile.GetId(),
+				Name:       profile.GetName(),
+				VideoCodec: profile.GetVideoCodec(),
+				AudioCodec: profile.GetAudioCodec(),
+				Preset:     profile.GetPreset(),
+				Crf:        profile.GetCrf(),
+				MaxWidth:   0,
+				MaxHeight:  int32(h),
+				UseGpu:     profile.GetUseGpu(),
+				Container:  profile.GetContainer(),
+			}
+		}
 	}
 
 	select {
@@ -130,7 +161,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	defer func() { m.playbackSlots <- struct{}{} }()
 
 	picked := m.pickStreamEncoder(profile, encoderMode)
-	args := m.buildPlaybackStreamArgs(profile, input, encoderMode)
+	args := m.buildPlaybackStreamArgs(profile, input, encoderMode, startSeconds, audioStreamIndex)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -157,6 +188,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Transcode-Profile", profileID)
 	w.Header().Set("X-Transcode-Encoder", string(picked))
+	w.Header().Set("X-Transcode-Start-Seconds", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	w.WriteHeader(http.StatusOK)
 
 	if flusher, ok := w.(http.Flusher); ok {
