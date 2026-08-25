@@ -11,9 +11,9 @@ import (
 
 func TestNeedsHoldForReview(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		setup *transcodev1.TranscodeSetup
-		want bool
+		want  bool
 	}{
 		{"keep no hold", &transcodev1.TranscodeSetup{HoldForReview: true, SourceDisposition: "keep"}, false},
 		{"replace hold", &transcodev1.TranscodeSetup{HoldForReview: true, SourceDisposition: "replace"}, true},
