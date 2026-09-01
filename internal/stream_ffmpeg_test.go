@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -9,18 +10,22 @@ import (
 
 func TestResolveStreamInput(t *testing.T) {
 	t.Parallel()
-	if _, err := resolveStreamInput(""); err == nil {
+	m := NewModule(Config{})
+	if _, err := m.resolveStreamInput(context.Background(), ""); err == nil {
 		t.Fatal("expected error for empty src")
 	}
-	if _, err := resolveStreamInput("relative/path.mkv"); err == nil {
+	if _, err := m.resolveStreamInput(context.Background(), "relative/path.mkv"); err == nil {
 		t.Fatal("expected error for relative path")
 	}
-	got, err := resolveStreamInput("http://127.0.0.1:9430/stream/movies/m1")
+	got, err := m.resolveStreamInput(context.Background(), "http://127.0.0.1:9430/stream/movies/m1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "http://127.0.0.1:9430/stream/movies/m1" {
 		t.Fatalf("got %q", got)
+	}
+	if _, err := m.resolveStreamInput(context.Background(), "https://evil.example/x.mkv"); err == nil {
+		t.Fatal("expected error for non-loopback url")
 	}
 }
 

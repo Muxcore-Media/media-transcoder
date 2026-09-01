@@ -74,7 +74,7 @@ func TestFilterSkipIfCodec(t *testing.T) {
 		ConfigJson: `{"codecs":["hevc","h265"]}`,
 		Enabled:    true,
 	}
-	skip, reason, err := m.evalStep("/x.mkv", info, step)
+	skip, reason, _, err := m.evalStep("/x.mkv", info, step)
 	if err != nil {
 		t.Fatal(err)
 	}

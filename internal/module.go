@@ -46,6 +46,7 @@ type Module struct {
 	httpAddr      string
 	hwEncoders    string
 	maxConcurrent int
+	scanInterval  string
 	mu            sync.RWMutex
 	cfgMu         sync.RWMutex
 	hwOnce        sync.Once
@@ -205,10 +206,19 @@ func (m *Module) Init(ctx context.Context) error {
 		closeDB()
 		return fmt.Errorf("setup tables: %w", setupErr)
 	}
+	if settingsErr := m.ensureSettingsTable(ctx, db); settingsErr != nil {
+		closeDB()
+		return fmt.Errorf("settings table: %w", settingsErr)
+	}
 
 	m.mu.Lock()
 	m.db = db
 	m.mu.Unlock()
+
+	if loadErr := m.loadSettings(ctx); loadErr != nil {
+		closeDB()
+		return fmt.Errorf("load settings: %w", loadErr)
+	}
 
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(ctx, "tcp", m.grpcAddr)
@@ -238,6 +248,7 @@ func (m *Module) Start(ctx context.Context) error {
 	m.scanCancel = scanCancel
 	go m.scheduledScanLoop(scanCtx)
 	m.startPlaybackHTTP()
+	go m.resumePendingWork(context.Background()) //nolint:gosec // module lifecycle goroutine
 	return nil
 }
 
@@ -387,17 +398,35 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 }
 
 func (m *Module) CancelJob(ctx context.Context, req *transcodev1.CancelJobRequest) (*transcodev1.CancelJobResponse, error) {
-	m.jobsMu.Lock()
-	js, ok := m.jobs[req.GetJobId()]
-	m.jobsMu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
+	jobID := strings.TrimSpace(req.GetJobId())
+	if jobID == "" {
+		return nil, fmt.Errorf("job_id is required")
 	}
-	if js.cancel != nil {
+
+	m.mu.RLock()
+	row := m.db.QueryRowContext(ctx, `SELECT status FROM transcode_jobs WHERE id = ?`, jobID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		m.mu.RUnlock()
+		return nil, fmt.Errorf("job not found: %s", jobID)
+	}
+	m.mu.RUnlock()
+
+	switch status {
+	case "completed", "failed", "cancelled":
+		return &transcodev1.CancelJobResponse{}, nil
+	}
+
+	m.jobsMu.Lock()
+	js, ok := m.jobs[jobID]
+	m.jobsMu.Unlock()
+	if ok && js.cancel != nil {
 		js.cancel()
 	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
 	m.mu.Lock()
-	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'cancelled', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), req.GetJobId())
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'cancelled', error = 'cancelled', completed_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
 	m.mu.Unlock()
 	return &transcodev1.CancelJobResponse{}, nil
 }
@@ -526,11 +555,11 @@ func (m *Module) runJob(ctx context.Context, jobID string, profile *transcodev1.
 		return
 	}
 
-	m.monitorProgress(js, stderr)
+	m.monitorProgress(ctx, jobID, js, stderr)
 	err = cmd.Wait()
 	if err != nil {
 		if ctx.Err() != nil {
-			m.failJob(ctx, js, "cancelled")
+			m.cancelJob(ctx, js)
 		} else {
 			m.failJob(ctx, js, fmt.Sprintf("ffmpeg error: %v", err))
 		}
@@ -540,13 +569,14 @@ func (m *Module) runJob(ctx context.Context, jobID string, profile *transcodev1.
 	m.completeJob(ctx, js)
 }
 
-func (m *Module) monitorProgress(js *jobState, stderr ioReadCloser) {
+func (m *Module) monitorProgress(ctx context.Context, jobID string, js *jobState, stderr ioReadCloser) {
 	scanner := bufio.NewScanner(stderr)
 	reProgress := regexp.MustCompile(`time=(\d+):(\d+):(\d+)\.(\d+)`)
 	reFPS := regexp.MustCompile(`fps=\s*(\d+\.?\d*)`)
 	reDuration := regexp.MustCompile(`Duration: (\d+):(\d+):(\d+)\.(\d+)`)
 
 	var durationSec float64
+	var lastPersist time.Time
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -554,6 +584,7 @@ func (m *Module) monitorProgress(js *jobState, stderr ioReadCloser) {
 		if d := reDuration.FindStringSubmatch(line); len(d) >= 5 {
 			durationSec = parseTimeToSec(d[1], d[2], d[3], d[4])
 		}
+		progressChanged := false
 		if p := reProgress.FindStringSubmatch(line); len(p) >= 5 {
 			currentSec := parseTimeToSec(p[1], p[2], p[3], p[4])
 			if durationSec > 0 {
@@ -562,14 +593,37 @@ func (m *Module) monitorProgress(js *jobState, stderr ioReadCloser) {
 					progress = 1.0
 				}
 				js.info.Progress = progress
+				progressChanged = true
 			}
 		}
 		if f := reFPS.FindStringSubmatch(line); len(f) >= 2 {
 			if fps, err := strconv.ParseFloat(f[1], 64); err == nil {
 				js.info.Fps = fps
+				progressChanged = true
 			}
 		}
+		if progressChanged && time.Since(lastPersist) >= 2*time.Second {
+			lastPersist = time.Now()
+			now := lastPersist.UTC().Format(time.RFC3339)
+			m.mu.Lock()
+			_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET progress = ?, fps = ?, updated_at = ? WHERE id = ?`,
+				js.info.Progress, js.info.Fps, now, jobID)
+			m.mu.Unlock()
+		}
 	}
+}
+
+func (m *Module) cancelJob(ctx context.Context, js *jobState) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	js.info.Status = "cancelled"
+	js.info.Error = "cancelled"
+	js.info.CompletedAt = now
+	js.info.UpdatedAt = now
+	js.running = false
+
+	m.mu.Lock()
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'cancelled', error = 'cancelled', completed_at = ?, updated_at = ? WHERE id = ?`, now, now, js.info.Id)
+	m.mu.Unlock()
 }
 
 func (m *Module) failJob(ctx context.Context, js *jobState, errMsg string) {

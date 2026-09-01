@@ -10,5 +10,5 @@ RUN apk add --no-cache ffmpeg && adduser -D -h /data app
 USER app
 WORKDIR /app
 COPY --from=builder /build/module ./media-transcoder
-EXPOSE 9520
+EXPOSE 9525 9526
 ENTRYPOINT ["./media-transcoder"]

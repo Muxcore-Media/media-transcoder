@@ -110,12 +110,7 @@ func eventFilePath(eventType string, payload []byte) string {
 }
 
 func (m *Module) scheduledScanLoop(ctx context.Context) {
-	interval := 6 * time.Hour
-	if v := os.Getenv("TRANSCODER_SCAN_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= time.Minute {
-			interval = d
-		}
-	}
+	interval := m.getScanInterval()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

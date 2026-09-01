@@ -65,7 +65,10 @@ func (m *Module) handleTrickplaySprite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	input, err := resolveStreamInput(r.URL.Query().Get("src"))
+	if !m.requirePlaybackAuth(w, r) {
+		return
+	}
+	input, err := m.resolveStreamInput(r.Context(), r.URL.Query().Get("src"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

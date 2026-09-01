@@ -3,7 +3,7 @@ package internal
 import "testing"
 
 func TestSettingsFFmpegBin(t *testing.T) {
-	m := NewModule(Config{})
+	m := newTestModule(t)
 	if got := m.getFFmpegBin(); got != "ffmpeg" {
 		t.Fatalf("default=%q", got)
 	}

@@ -51,7 +51,7 @@ func (m *Module) ApprovePipelineRun(ctx context.Context, req *transcodev1.Approv
 	if setup == nil {
 		return nil, fmt.Errorf("setup not found: %s", run.GetSetupId())
 	}
-	if err := m.applySourceDisposition(run.GetInputPath(), setup); err != nil {
+	if err := m.applySourceDisposition(ctx, runID, run.GetInputPath(), setup); err != nil {
 		m.updatePipelineRunStatus(ctx, runID, "failed", "", err.Error())
 		return nil, err
 	}

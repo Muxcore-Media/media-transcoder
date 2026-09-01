@@ -387,7 +387,7 @@ func (m *Module) buildFFmpegArgs(profile *transcodev1.TranscodeProfile, input, o
 	}
 	backend := m.pickHWBackend(profile, hwAuto, videoCodec)
 
-	args := []string{"-hide_banner", "-y", "-progress", "pipe:1"}
+	args := []string{"-hide_banner", "-y"}
 	args = append(args, m.hwAccelInputArgs(backend)...)
 	args = append(args, "-i", input)
 

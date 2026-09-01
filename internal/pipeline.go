@@ -204,7 +204,7 @@ func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.Transc
 }
 
 func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *transcodev1.TranscodeSetup, inputPath string) {
-	skipReason, err := m.evaluatePipelineFilters(inputPath, setup.GetSteps())
+	skipReason, workingPath, err := m.evaluatePipelineFilters(inputPath, setup.GetSteps())
 	if err != nil {
 		m.finishPipelineRun(ctx, runID, "failed", "", err.Error())
 		return
@@ -212,6 +212,9 @@ func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *tr
 	if skipReason != "" {
 		m.finishPipelineRun(ctx, runID, "skipped", skipReason, "")
 		return
+	}
+	if workingPath == "" {
+		workingPath = inputPath
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -229,8 +232,8 @@ func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *tr
 			m.finishPipelineRun(ctx, runID, "failed", "", fmt.Sprintf("profile not found: %s", out.GetProfileId()))
 			return
 		}
-		outputPath := computeOutputPath(inputPath, out, profile)
-		if outputPath == inputPath {
+		outputPath := computeOutputPath(workingPath, out, profile)
+		if outputPath == workingPath {
 			m.finishPipelineRun(ctx, runID, "failed", "", "output path equals input path")
 			return
 		}
@@ -242,7 +245,7 @@ func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *tr
 		m.mu.Unlock()
 
 		resp, err := m.Enqueue(ctx, &transcodev1.EnqueueRequest{
-			InputPath:  inputPath,
+			InputPath:  workingPath,
 			OutputPath: outputPath,
 			ProfileId:  out.GetProfileId(),
 		})
@@ -301,7 +304,7 @@ func (m *Module) waitForJobsAndFinalize(ctx context.Context, runID string, setup
 				m.finishPipelineRun(ctx, runID, "pending_review", "", "")
 				return
 			}
-			if err := m.applySourceDisposition(inputPath, setup); err != nil {
+			if err := m.applySourceDisposition(ctx, runID, inputPath, setup); err != nil {
 				m.finishPipelineRun(ctx, runID, "failed", "", err.Error())
 				return
 			}
@@ -345,24 +348,32 @@ func (m *Module) finishPipelineRun(ctx context.Context, runID, status, skipReaso
 	slog.Info("pipeline run finished", "run", runID, "status", status)
 }
 
-func (m *Module) evaluatePipelineFilters(inputPath string, steps []*transcodev1.PipelineStep) (skipReason string, err error) {
+func (m *Module) evaluatePipelineFilters(inputPath string, steps []*transcodev1.PipelineStep) (skipReason, workingPath string, err error) {
 	info, err := m.probeFile(inputPath)
 	if err != nil {
-		return "", err
+		return "", "", fmt.Errorf("probe failed: %w", err)
 	}
+	workingPath = inputPath
 	for _, step := range steps {
 		if step == nil || !step.GetEnabled() {
 			continue
 		}
-		skip, reason, err := m.evalStep(inputPath, info, step)
-		if err != nil {
-			return "", err
+		skip, reason, probePath, stepErr := m.evalStep(workingPath, info, step)
+		if stepErr != nil {
+			return "", "", stepErr
 		}
 		if skip {
-			return reason, nil
+			return reason, "", nil
+		}
+		if probePath != "" && probePath != workingPath {
+			workingPath = probePath
+			info, err = m.probeFile(workingPath)
+			if err != nil {
+				return "", "", fmt.Errorf("probe remux sidecar: %w", err)
+			}
 		}
 	}
-	return "", nil
+	return "", workingPath, nil
 }
 
 type probeInfo struct {
@@ -372,75 +383,89 @@ type probeInfo struct {
 	SizeBytes  int64
 }
 
-func (m *Module) evalStep(inputPath string, info *probeInfo, step *transcodev1.PipelineStep) (skip bool, reason string, err error) {
+func (m *Module) evalStep(inputPath string, info *probeInfo, step *transcodev1.PipelineStep) (skip bool, reason, probePath string, err error) {
 	cfg := map[string]any{}
 	_ = json.Unmarshal([]byte(step.GetConfigJson()), &cfg)
 	switch step.GetStepType() {
 	case "filter.skip_if_codec":
 		for _, c := range stringList(cfg["codecs"]) {
 			if codecMatches(info.VideoCodec, c) {
-				return true, fmt.Sprintf("already %s", c), nil
+				return true, fmt.Sprintf("already %s", c), "", nil
 			}
 		}
 	case "filter.skip_if_container":
 		for _, c := range stringList(cfg["containers"]) {
 			if strings.EqualFold(info.Container, c) {
-				return true, fmt.Sprintf("already %s container", c), nil
+				return true, fmt.Sprintf("already %s container", c), "", nil
 			}
 		}
 	case "filter.min_size_mb":
 		minMB := floatFrom(cfg["min_mb"])
 		if minMB > 0 && float64(info.SizeBytes) < minMB*1024*1024 {
-			return true, fmt.Sprintf("below min size %.0f MB", minMB), nil
+			return true, fmt.Sprintf("below min size %.0f MB", minMB), "", nil
 		}
 	case "filter.max_size_mb":
 		maxMB := floatFrom(cfg["max_mb"])
 		if maxMB > 0 && float64(info.SizeBytes) > maxMB*1024*1024 {
-			return true, fmt.Sprintf("above max size %.0f MB", maxMB), nil
+			return true, fmt.Sprintf("above max size %.0f MB", maxMB), "", nil
 		}
 	case "filter.extension":
 		allowed := stringList(cfg["extensions"])
 		if len(allowed) > 0 && !containsFold(allowed, info.Extension) {
-			return true, "extension not allowed", nil
+			return true, "extension not allowed", "", nil
 		}
 	case "filter.skip_if_output_exists":
 		suffix := fmt.Sprint(cfg["suffix"])
 		if suffix != "" {
 			candidate := strings.TrimSuffix(inputPath, info.Extension) + suffix + info.Extension
-			if _, err := os.Stat(candidate); err == nil {
-				return true, "output already exists", nil
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				return true, "output already exists", "", nil
 			}
 		}
 	case "action.remux":
 		container := strings.ToLower(fmt.Sprint(cfg["container"]))
 		if container != "" && !strings.EqualFold(info.Container, container) {
-			if err := m.remuxContainer(inputPath, container); err != nil {
-				return false, "", err
+			sidecar, remuxErr := m.remuxContainerSidecar(inputPath, container)
+			if remuxErr != nil {
+				return false, "", "", remuxErr
 			}
-			info.Container = container
-			info.Extension = "." + container
+			probeInfo, probeErr := m.probeFile(sidecar)
+			if probeErr != nil {
+				return false, "", "", probeErr
+			}
+			info.Container = probeInfo.Container
+			info.Extension = probeInfo.Extension
+			info.VideoCodec = probeInfo.VideoCodec
+			info.SizeBytes = probeInfo.SizeBytes
+			return false, "", sidecar, nil
 		}
 	}
-	return false, "", nil
+	return false, "", "", nil
 }
 
-func (m *Module) remuxContainer(inputPath, container string) error {
+func (m *Module) remuxContainerSidecar(inputPath, container string) (string, error) {
 	dir := filepath.Dir(inputPath)
 	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
-	tmp := filepath.Join(dir, base+".remux."+container)
-	args := []string{"-i", inputPath, "-c", "copy", "-y", tmp}
+	sidecar := filepath.Join(dir, base+".remux-sidecar."+container)
+	args := []string{"-i", inputPath, "-c", "copy", "-y", sidecar}
 	cmd := exec.Command(m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("remux: %w: %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("remux: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, base+"."+container)); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	return sidecar, nil
+}
+
+func (m *Module) getFFprobeBin() string {
+	if v := strings.TrimSpace(os.Getenv("TRANSCODER_FFPROBE_BIN")); v != "" {
+		return v
 	}
-	if filepath.Join(dir, base+"."+container) != inputPath {
-		_ = os.Remove(inputPath)
+	ffmpeg := m.getFFmpegBin()
+	dir := filepath.Dir(ffmpeg)
+	base := filepath.Base(ffmpeg)
+	if idx := strings.LastIndex(base, "ffmpeg"); idx >= 0 {
+		return filepath.Join(dir, base[:idx]+"ffprobe"+base[idx+len("ffmpeg"):])
 	}
-	return nil
+	return "ffprobe"
 }
 
 func (m *Module) probeFile(path string) (*probeInfo, error) {
@@ -455,18 +480,22 @@ func (m *Module) probeFile(path string) (*probeInfo, error) {
 		Extension: ext,
 	}
 	args := []string{"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1", path}
-	cmd := exec.Command("ffprobe", args...) //nolint:gosec // ffprobe reads operator-controlled media paths
+	cmd := exec.Command(m.getFFprobeBin(), args...) //nolint:gosec // ffprobe reads operator-controlled media paths
 	out, err := cmd.Output()
-	if err == nil {
-		line := strings.TrimSpace(string(out))
-		if idx := strings.Index(line, "="); idx >= 0 {
-			info.VideoCodec = strings.TrimSpace(line[idx+1:])
-		}
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe: %w", err)
+	}
+	line := strings.TrimSpace(string(out))
+	if idx := strings.Index(line, "="); idx >= 0 {
+		info.VideoCodec = strings.TrimSpace(line[idx+1:])
+	}
+	if info.VideoCodec == "" {
+		return nil, fmt.Errorf("ffprobe: no video stream codec for %s", path)
 	}
 	return info, nil
 }
 
-func (m *Module) applySourceDisposition(inputPath string, setup *transcodev1.TranscodeSetup) error {
+func (m *Module) applySourceDisposition(ctx context.Context, runID, inputPath string, setup *transcodev1.TranscodeSetup) error {
 	switch normalizeDisposition(setup.GetSourceDisposition()) {
 	case "keep":
 		return nil
@@ -483,7 +512,40 @@ func (m *Module) applySourceDisposition(inputPath string, setup *transcodev1.Tra
 		dest := filepath.Join(archiveDir, filepath.Base(inputPath))
 		return os.Rename(inputPath, dest)
 	case "replace":
-		return os.Remove(inputPath)
+		run, err := m.loadPipelineRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		if run == nil {
+			return fmt.Errorf("pipeline run not found: %s", runID)
+		}
+		var replacement string
+		for _, out := range run.GetOutputs() {
+			if out.GetStatus() != "completed" && out.GetStatus() != "running" {
+				continue
+			}
+			path := strings.TrimSpace(out.GetOutputPath())
+			if path == "" {
+				continue
+			}
+			if _, statErr := os.Stat(path); statErr == nil {
+				replacement = path
+				break
+			}
+		}
+		if replacement == "" {
+			return fmt.Errorf("replace disposition requires a completed output")
+		}
+		if replacement == inputPath {
+			return nil
+		}
+		if err := os.Remove(inputPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove original for replace: %w", err)
+		}
+		if err := os.Rename(replacement, inputPath); err != nil {
+			return fmt.Errorf("move output onto source path: %w", err)
+		}
+		return nil
 	default:
 		return nil
 	}

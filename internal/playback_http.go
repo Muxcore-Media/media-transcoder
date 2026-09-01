@@ -37,7 +37,7 @@ func (m *Module) ensurePlaybackSlots() {
 func (m *Module) startPlaybackHTTP() {
 	addr := strings.TrimSpace(os.Getenv("TRANSCODER_HTTP_ADDR"))
 	if addr == "" {
-		addr = ":9526"
+		addr = defaultPlaybackHTTPAddr()
 	}
 	maxPlayback := 4
 	if v := strings.TrimSpace(os.Getenv("TRANSCODER_MAX_PLAYBACK")); v != "" {
@@ -97,8 +97,11 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !m.requirePlaybackAuth(w, r) {
+		return
+	}
 
-	input, err := resolveStreamInput(r.URL.Query().Get("src"))
+	input, err := m.resolveStreamInput(r.Context(), r.URL.Query().Get("src"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

@@ -38,6 +38,7 @@ func TestHandlePlaybackStreamSoftwareIntegration(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	t.Setenv("TRANSCODER_LIBRARY_PATHS", dir)
 	inPath := filepath.Join(dir, "in.mkv")
 	outProbe := filepath.Join(dir, "probe.txt")
 	cmd := exec.Command(ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24",
@@ -99,6 +100,7 @@ func TestHandlePlaybackStreamMaxHeightOverride(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	t.Setenv("TRANSCODER_LIBRARY_PATHS", dir)
 	inPath := filepath.Join(dir, "in.mkv")
 	cmd := exec.Command(ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc=size=640x480:rate=24",
 		"-f", "lavfi", "-i", "sine=frequency=440:duration=2",

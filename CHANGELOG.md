@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.3] — 2026-08-21
+## [0.3.3] — 2026-08-31
 
 ### Added
 
@@ -9,10 +9,22 @@
 - Platform-aware auto backend priority (e.g. VideoToolbox first on macOS, QSV/AMF prioritized on Windows).
 - `TRANSCODER_QSV_DEVICE` for Intel QSV render node configuration.
 - Playback `gpu` query values: `qsv`, `amf`, `videotoolbox` (plus existing `auto`, `software`, `nvenc`, `vaapi`).
+- Playback HTTP hardening: loopback default bind, library path allowlists, optional `TRANSCODER_HTTP_TOKEN`, SSRF rejection for non-loopback URLs.
+- Job and pipeline run resume after process restart; `CancelJob` works from SQLite without in-memory state.
+- Throttled progress/fps persistence during transcode jobs.
+- SQLite-backed settings for `ffmpeg_bin`, `max_concurrent`, and `scan_interval`.
+- `replace` source disposition moves the first completed output onto the original path.
+- FFprobe derived from FFmpeg path (`TRANSCODER_FFPROBE_BIN` override); probe failures fail closed.
+- Pool gRPC dial honors mesh TLS unless `MUXCORE_INSECURE_DISABLE_TLS` / `MUXCORE_GRPC_INSECURE`.
+- Remux pipeline action writes a sidecar file instead of mutating the source during filter eval.
+- Forgejo CI: `golangci-lint` + `go test -race`.
 
 ### Changed
 
 - Offline batch jobs now use the same hardware backend selection as playback (not NVENC-only).
+- Default `TRANSCODER_HTTP_ADDR` is `127.0.0.1:9526` (was `:9526`).
+- Removed unused `-progress pipe:1` from offline FFmpeg args (stderr `time=` parsing retained).
+- `Dockerfile` exposes 9525/9526 (was 9520).
 
 ## [0.3.2] — 2026-08-21
 

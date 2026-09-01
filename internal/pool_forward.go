@@ -2,17 +2,30 @@ package internal
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	transcoderpoolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 )
+
+func poolInsecureMode() bool {
+	return os.Getenv("MUXCORE_INSECURE_DISABLE_TLS") == "true" || os.Getenv("MUXCORE_GRPC_INSECURE") == "true"
+}
+
+func (m *Module) poolDialOptions() []grpc.DialOption {
+	if poolInsecureMode() {
+		return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	}
+	return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))}
+}
 
 func (m *Module) poolEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("TRANSCODER_USE_POOL")))
@@ -45,7 +58,7 @@ func (m *Module) enqueueViaPool(ctx context.Context, req *transcodev1.EnqueueReq
 	if err != nil {
 		return "", err
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, m.poolDialOptions()...)
 	if err != nil {
 		return "", err
 	}
@@ -72,7 +85,7 @@ func (m *Module) waitForPoolJob(ctx context.Context, poolJobID, localJobID strin
 		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, m.poolDialOptions()...)
 	if err != nil {
 		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return
