@@ -7,18 +7,27 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  GOPRIVATE: github.com/Muxcore-Media/*
 jobs:
   lint:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
         with:
-          path: core
-          repository: Muxcore-Media/core
-          token: ${{ secrets.MUXCORE_CI_TOKEN }}
-      - uses: actions/checkout@v7
-        with:
-          path: media-transcoder
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+      - name: Checkout core dependency
+        env:
+          TOKEN: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/Muxcore-Media/core.git" core
+      - name: Prepare workspace layout
+        run: |
+          mkdir -p media-transcoder
+          shopt -s dotglob
+          for item in *; do
+            case "$item" in core|media-transcoder) continue ;; esac
+            mv "$item" media-transcoder/
+          done
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
@@ -29,14 +38,22 @@ jobs:
   test:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
         with:
-          path: core
-          repository: Muxcore-Media/core
-          token: ${{ secrets.MUXCORE_CI_TOKEN }}
-      - uses: actions/checkout@v7
-        with:
-          path: media-transcoder
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+      - name: Checkout core dependency
+        env:
+          TOKEN: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/Muxcore-Media/core.git" core
+      - name: Prepare workspace layout
+        run: |
+          mkdir -p media-transcoder
+          shopt -s dotglob
+          for item in *; do
+            case "$item" in core|media-transcoder) continue ;; esac
+            mv "$item" media-transcoder/
+          done
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
@@ -47,14 +64,22 @@ jobs:
   build:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v7
+      - uses: Muxcore-Media/mvp/.github/actions/checkout-mirror@main
         with:
-          path: core
-          repository: Muxcore-Media/core
-          token: ${{ secrets.MUXCORE_CI_TOKEN }}
-      - uses: actions/checkout@v7
-        with:
-          path: media-transcoder
+          token: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+      - name: Checkout core dependency
+        env:
+          TOKEN: ${{ secrets.MUXCORE_CI_TOKEN || github.token }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/Muxcore-Media/core.git" core
+      - name: Prepare workspace layout
+        run: |
+          mkdir -p media-transcoder
+          shopt -s dotglob
+          for item in *; do
+            case "$item" in core|media-transcoder) continue ;; esac
+            mv "$item" media-transcoder/
+          done
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
