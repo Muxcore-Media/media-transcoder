@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.5] — 2026-09-08
+
+### Added
+- HLS playback remounts from `start=` (input `-ss`) so a household scrub past written segments starts a new playlist instead of 404ing.
+- Segment GETs wait up to 20s for ffmpeg to write the first `.ts` of a remount.
+
 ## [0.3.3] — 2026-08-21
 
 ### Added

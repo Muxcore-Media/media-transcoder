@@ -153,6 +153,121 @@ func TestHandlePlaybackStreamMaxHeightOverride(t *testing.T) {
 	}
 }
 
+func TestHandleHLSRejectsBadInput(t *testing.T) {
+	m := newTestModule(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stream/hls", m.handleHLSRedirect)
+	mux.HandleFunc("GET /stream/hls/{key}/{file}", m.handleHLSAsset)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/stream/hls?src=relative.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+
+	resp2, err := http.Get(srv.URL + "/stream/hls/not-hex/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("asset status=%d", resp2.StatusCode)
+	}
+}
+
+func TestHandleHLSIntegration(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+
+	dir := t.TempDir()
+	t.Setenv("TRANSCODER_HLS_CACHE", filepath.Join(dir, "hls"))
+	inPath := filepath.Join(dir, "in.mkv")
+	cmd := exec.Command(ffmpeg, "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+		"-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", inPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("ffmpeg fixture: %v\n%s", err, out)
+	}
+
+	m := newTestModule(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stream/hls", m.handleHLSRedirect)
+	mux.HandleFunc("GET /stream/hls/{key}/{file}", m.handleHLSAsset)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := &http.Client{
+		Timeout: 45 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(srv.URL + "/stream/hls?src=" + inPath + "&gpu=software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/stream/hls/") || !strings.HasSuffix(loc, "/index.m3u8") {
+		t.Fatalf("location=%q", loc)
+	}
+
+	follow := &http.Client{Timeout: 45 * time.Second}
+	playlist, err := follow.Get(srv.URL + loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer playlist.Body.Close()
+	if playlist.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(playlist.Body)
+		t.Fatalf("playlist status=%d body=%s", playlist.StatusCode, body)
+	}
+	if ct := playlist.Header.Get("Content-Type"); !strings.Contains(ct, "mpegurl") {
+		t.Fatalf("content-type=%q", ct)
+	}
+	body, _ := io.ReadAll(playlist.Body)
+	if !bytes.Contains(body, []byte("#EXTM3U")) || !bytes.Contains(body, []byte("seg_")) {
+		t.Fatalf("playlist=%s", body)
+	}
+
+	segName := ""
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "seg_") && strings.HasSuffix(line, ".ts") {
+			segName = line
+			break
+		}
+	}
+	if segName == "" {
+		t.Fatalf("no segment in playlist: %s", body)
+	}
+	base := strings.TrimSuffix(loc, "index.m3u8")
+	seg, err := follow.Get(srv.URL + base + segName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seg.Body.Close()
+	if seg.StatusCode != http.StatusOK {
+		t.Fatalf("segment status=%d", seg.StatusCode)
+	}
+	chunk := make([]byte, 188)
+	n, _ := io.ReadFull(seg.Body, chunk)
+	if n < 188 || chunk[0] != 0x47 {
+		t.Fatalf("expected MPEG-TS sync byte, n=%d", n)
+	}
+}
+
 func TestHandlePlaybackHardwareJSON(t *testing.T) {
 	m := newTestModule(t)
 	mux := http.NewServeMux()

@@ -60,6 +60,8 @@ func (m *Module) startPlaybackHTTP() {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("GET /stream/transcode", m.handlePlaybackStream)
+	mux.HandleFunc("GET /stream/hls", m.handleHLSRedirect)
+	mux.HandleFunc("GET /stream/hls/{key}/{file}", m.handleHLSAsset)
 	mux.HandleFunc("GET /api/playback/hardware", m.handlePlaybackHardware)
 	mux.HandleFunc("GET /stream/trickplay", m.handleTrickplaySprite)
 
@@ -98,57 +100,27 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	input, err := resolveStreamInput(r.URL.Query().Get("src"))
+	q, err := parsePlaybackQuery(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	profileID := strings.TrimSpace(r.URL.Query().Get("profile"))
-	if profileID == "" {
-		profileID = "h264_fast"
-	}
-	encoderMode := parseStreamEncoderMode(r.URL.Query().Get("gpu"))
-	startSeconds := 0.0
-	if raw := strings.TrimSpace(r.URL.Query().Get("start")); raw != "" {
-		if v, parseErr := strconv.ParseFloat(raw, 64); parseErr == nil && v > 0 {
-			startSeconds = v
-		}
-	}
-	audioStreamIndex := -1
-	if raw := strings.TrimSpace(r.URL.Query().Get("audio_index")); raw != "" {
-		if v, parseErr := strconv.Atoi(raw); parseErr == nil && v >= 0 {
-			audioStreamIndex = v
-		}
-	}
-
 	m.ensurePlaybackSlots()
 
 	m.mu.RLock()
-	profile := m.loadProfile(r.Context(), profileID)
+	profile := applyPlaybackMaxHeight(m.loadProfile(r.Context(), q.profileID), q.maxHeight)
 	m.mu.RUnlock()
 	if profile == nil {
 		http.Error(w, "profile not found", http.StatusBadRequest)
 		return
 	}
-	// Manual quality selection (player "Quality" menu): cap output height
-	// without needing a dedicated profile per resolution.
-	if raw := strings.TrimSpace(r.URL.Query().Get("max_height")); raw != "" {
-		if h, hErr := strconv.Atoi(raw); hErr == nil && h > 0 {
-			profile = &transcodev1.TranscodeProfile{
-				Id:         profile.GetId(),
-				Name:       profile.GetName(),
-				VideoCodec: profile.GetVideoCodec(),
-				AudioCodec: profile.GetAudioCodec(),
-				Preset:     profile.GetPreset(),
-				Crf:        profile.GetCrf(),
-				MaxWidth:   0,
-				MaxHeight:  int32(h), //nolint:gosec // query param capped by operator-controlled player UI
-				UseGpu:     profile.GetUseGpu(),
-				Container:  profile.GetContainer(),
-			}
-		}
-	}
+	profileID := q.profileID
+	encoderMode := q.encoderMode
+	startSeconds := q.startSeconds
+	audioStreamIndex := q.audioIndex
+	subtitleStreamIndex := q.subtitleIndex
+	input := q.input
 
 	select {
 	case <-m.playbackSlots:
@@ -161,7 +133,7 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 	defer func() { m.playbackSlots <- struct{}{} }()
 
 	picked := m.pickStreamEncoder(profile, encoderMode)
-	args := m.buildPlaybackStreamArgs(profile, input, encoderMode, startSeconds, audioStreamIndex)
+	args := m.buildPlaybackStreamArgs(profile, input, encoderMode, startSeconds, audioStreamIndex, subtitleStreamIndex)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 

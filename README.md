@@ -77,8 +77,10 @@ Requires `ffmpeg` on `PATH` (Health fails closed without it).
 When transcoding is enabled in playback policy and direct play is not preferred, the media UI BFF proxies:
 
 ```
+GET /stream/hls?src=/stream/movies/{id}
+  → 302 /stream/hls/{key}/index.m3u8
 GET /stream/transcode?src=/stream/movies/{id}
-  → GET http://127.0.0.1:9526/stream/transcode?src=http://127.0.0.1:9430/stream/movies/{id}
+  → piped fMP4 fallback (input -ss via start=)
 ```
 
 Query parameters on the transcoder endpoint:

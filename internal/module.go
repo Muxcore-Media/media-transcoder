@@ -52,6 +52,8 @@ type Module struct {
 	pipelineMu    sync.Mutex
 	playbackMu    sync.Mutex
 	jobsMu        sync.Mutex
+	hlsMu         sync.Mutex
+	hlsSessions   map[string]*hlsSession
 }
 
 type jobState struct {
@@ -108,6 +110,7 @@ func NewModule(cfg Config) *Module {
 		jobSlots:      slots,
 		jobs:          make(map[string]*jobState),
 		pipelineJobs:  make(map[string]string),
+		hlsSessions:   make(map[string]*hlsSession),
 	}
 }
 
@@ -115,7 +118,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:        "0.3.3",
+		Version:        "0.3.5",
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with Tdarr-style configurable setups, multi-output pipelines, and job queue",
 		Author:         "MuxCore",
@@ -242,6 +245,7 @@ func (m *Module) Start(ctx context.Context) error {
 }
 
 func (m *Module) Stop(ctx context.Context) error {
+	m.stopHLSSessions()
 	if m.scanCancel != nil {
 		m.scanCancel()
 	}

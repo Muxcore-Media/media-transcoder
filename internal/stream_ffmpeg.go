@@ -38,14 +38,13 @@ func resolveStreamInput(src string) (string, error) {
 	return src, nil
 }
 
-func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int) []string {
+func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int) []string {
 	encoder := m.pickStreamEncoder(profile, mode)
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = append(args, m.hwAccelInputArgs(encoder)...)
 	if startSeconds > 0 {
-		// Input-side seek: fast (keyframe-aligned) restart point for scrubbing
-		// during transcode, since the piped fmp4 output has no server-side
-		// random access once written to the response body.
+		// Input-side seek: fast (keyframe-aligned) restart for HLS remounts
+		// and the piped fMP4 fallback. The player tracks wall-clock offset.
 		args = append(args, "-ss", fmt.Sprintf("%.3f", startSeconds))
 	}
 	args = append(args, "-i", input)
@@ -55,16 +54,22 @@ func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, 
 		args = append(args, "-avoid_negative_ts", "make_zero")
 	}
 
-	args = append(args, "-map", "0:v:0")
+	if subtitleStreamIndex >= 0 {
+		// PGS / VobSub / other picture subs must be burned in. Overlay is
+		// software-only, so scale on CPU even when the encoder is GPU.
+		args = append(args, "-filter_complex", overlayBurnFilter(m.scaleFilter(profile, streamEncoderSoftware), subtitleStreamIndex), "-map", "[vout]")
+	} else {
+		args = append(args, "-map", "0:v:0")
+		if vf := m.scaleFilter(profile, encoder); vf != "" {
+			args = append(args, "-vf", vf)
+		}
+	}
 	if audioStreamIndex >= 0 {
 		args = append(args, "-map", fmt.Sprintf("0:%d", audioStreamIndex))
 	} else {
 		args = append(args, "-map", "0:a:0")
 	}
 
-	if vf := m.scaleFilter(profile, encoder); vf != "" {
-		args = append(args, "-vf", vf)
-	}
 	args = append(args, m.videoEncodeArgs(profile, encoder)...)
 
 	audioCodec := profile.GetAudioCodec()
@@ -73,13 +78,38 @@ func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, 
 	} else {
 		args = append(args, "-c:a", audioCodec)
 	}
+	return args
+}
 
-	args = append(args,
+func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int) []string {
+	args := m.buildPlaybackEncodeArgs(profile, input, mode, startSeconds, audioStreamIndex, subtitleStreamIndex)
+	return append(args,
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 		"-f", "mp4",
 		"pipe:1",
 	)
-	return args
+}
+
+func (m *Module) buildHLSStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int, playlistPath string, segmentPattern string) []string {
+	args := m.buildPlaybackEncodeArgs(profile, input, mode, startSeconds, audioStreamIndex, subtitleStreamIndex)
+	return append(args,
+		"-f", "hls",
+		"-hls_time", "4",
+		"-hls_list_size", "0",
+		"-hls_playlist_type", "event",
+		"-hls_flags", "independent_segments+append_list+temp_file",
+		"-hls_segment_filename", segmentPattern,
+		playlistPath,
+	)
+}
+
+// overlayBurnFilter composites stream N onto the video pad. scaleVF is a
+// software scale=… filter or empty.
+func overlayBurnFilter(scaleVF string, subtitleStreamIndex int) string {
+	if scaleVF != "" {
+		return fmt.Sprintf("[0:v:0]%s[vscaled];[vscaled][0:%d]overlay[vout]", scaleVF, subtitleStreamIndex)
+	}
+	return fmt.Sprintf("[0:v:0][0:%d]overlay[vout]", subtitleStreamIndex)
 }
 
 func buildScaleExpression(maxW, maxH int32) string {
