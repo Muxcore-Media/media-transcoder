@@ -2,41 +2,9 @@ package internal
 
 import (
 	"fmt"
-	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 )
-
-func resolveStreamInput(src string) (string, error) {
-	src = strings.TrimSpace(src)
-	if src == "" {
-		return "", fmt.Errorf("src required")
-	}
-	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		u, err := url.Parse(src)
-		if err != nil {
-			return "", fmt.Errorf("invalid src url: %w", err)
-		}
-		if u.Host == "" {
-			return "", fmt.Errorf("invalid src url host")
-		}
-		return src, nil
-	}
-	if !filepath.IsAbs(src) {
-		return "", fmt.Errorf("src must be an absolute path or http(s) url")
-	}
-	st, err := os.Stat(src) //nolint:gosec // src is validated as absolute path or http(s) URL before stat
-	if err != nil {
-		return "", fmt.Errorf("src not accessible: %w", err)
-	}
-	if st.IsDir() {
-		return "", fmt.Errorf("src must be a file")
-	}
-	return src, nil
-}
 
 func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex, subtitleStreamIndex int) []string {
 	encoder := m.pickStreamEncoder(profile, mode)
@@ -47,7 +15,9 @@ func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, 
 		// and the piped fMP4 fallback. The player tracks wall-clock offset.
 		args = append(args, "-ss", fmt.Sprintf("%.3f", startSeconds))
 	}
-	args = append(args, "-i", input)
+	// Only the protocols the source needs: a local file never opens network
+	// or nested protocols (concat:, subfile:, playlists pointing elsewhere).
+	args = append(args, "-protocol_whitelist", ffmpegProtocolWhitelist(input), "-i", input)
 	if startSeconds > 0 {
 		// Renormalize timestamps so the fresh fmp4 init segment starts at 0;
 		// the player tracks the wall-clock offset itself (X-Transcode-Start-Seconds).

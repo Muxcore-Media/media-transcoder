@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.11] - 2026-10-05
+
+
+### Security
+- Playback HTTP API (`:9526`) now authenticates callers: in the mesh/household profile it is served over TLS with the module's mesh certificate and requires a client certificate verified against `MUXCORE_TLS_CA` with a CN in `TRANSCODER_HTTP_ALLOWED_CALLERS` (default `media-ui`); `GET /healthz` stays open. Start fails closed without the identity/CA. In the dev profile it binds `127.0.0.1:9526` by default and a non-loopback bind requires `TRANSCODER_HTTP_TOKEN` (bearer, constant-time).
+- Stream `src` (`/stream/transcode`, `/stream/hls`, `/stream/trickplay`) is confined to `TRANSCODER_MEDIA_ROOTS` via `pathguard.Confine` (symlinks resolved, `..` refused, sibling prefixes refused); unset roots refuse everything. http(s) sources are refused unless `TRANSCODER_ALLOW_URL_SOURCES=1`, and then must pass netguard (`TRANSCODER_URL_SOURCE_HOSTS` allow-list, else the strict UserURL profile). ffmpeg/ffprobe run with `-protocol_whitelist file` (`file,http,https,tcp,tls` for URL sources). Policy refusals return 403.
+- gRPC `Enqueue` confines `input_path` to the media roots and `output_path` to `TRANSCODER_OUTPUT_DIR` (default `<db dir>/output`); `ProcessFile`, `ScanSetups` root overrides and import-event pipelines confine inputs to the setup's `library_paths`; `UpsertSetup` validates `library_paths` / `archive_path` against the media roots and refuses output suffixes with path separators. Stored setups are re-checked at use: source delete/archive and review-reject output removal only touch entries inside the roots, and pipeline outputs must stay in the input's directory.
+- gRPC server and the transcoder-pool dial use mesh TLS (`meshtls`, sdk/go/module v0.6.6) unless the dev insecure flag is set (ADR-0016/0017).
+
 ## [0.3.10] - 2026-10-05
 
 ### Changed

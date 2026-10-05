@@ -41,13 +41,13 @@ type playbackQuery struct {
 	maxHeight     int
 }
 
-func parsePlaybackQuery(r *http.Request) (playbackQuery, error) {
+func (m *Module) parsePlaybackQuery(r *http.Request) (playbackQuery, error) {
 	q := playbackQuery{
 		profileID:     "h264_fast",
 		audioIndex:    -1,
 		subtitleIndex: -1,
 	}
-	input, err := resolveStreamInput(r.URL.Query().Get("src"))
+	input, err := m.resolveStreamInput(r.URL.Query().Get("src"))
 	if err != nil {
 		return q, err
 	}
@@ -154,9 +154,9 @@ func (m *Module) handleHLSRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	q, err := parsePlaybackQuery(r)
+	q, err := m.parsePlaybackQuery(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), streamInputStatus(err))
 		return
 	}
 	m.mu.RLock()

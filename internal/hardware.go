@@ -389,7 +389,7 @@ func (m *Module) buildFFmpegArgs(profile *transcodev1.TranscodeProfile, input, o
 
 	args := []string{"-hide_banner", "-y", "-progress", "pipe:1"}
 	args = append(args, m.hwAccelInputArgs(backend)...)
-	args = append(args, "-i", input)
+	args = append(args, "-protocol_whitelist", ffmpegProtocolWhitelist(input), "-i", input)
 
 	if vf := m.scaleFilter(profile, backend); vf != "" {
 		args = append(args, "-vf", vf)

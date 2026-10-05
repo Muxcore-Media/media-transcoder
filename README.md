@@ -37,13 +37,26 @@ Enqueue(input, output, profile) ──→ FFmpeg job ──→ output file
 |----------|---------|-------------|
 | `TRANSCODER_DB_PATH` | `/var/lib/media-transcoder/transcoder.db` | SQLite database path |
 | `TRANSCODER_GRPC_ADDR` | `:9525` | gRPC listen address |
-| `TRANSCODER_HTTP_ADDR` | `:9526` | Playback transcode HTTP listen address |
+| `TRANSCODER_HTTP_ADDR` | `:9526` (mesh TLS) / `127.0.0.1:9526` (dev) | Playback transcode HTTP listen address |
+| `TRANSCODER_HTTP_ALLOWED_CALLERS` | `media-ui` | Comma-separated mesh certificate CNs allowed to call the playback HTTP API (mesh TLS mode) |
+| `TRANSCODER_HTTP_TOKEN` | — | Dev (insecure) mode only: bearer token required on the playback HTTP API; mandatory for a non-loopback `TRANSCODER_HTTP_ADDR` |
+| `TRANSCODER_MEDIA_ROOTS` | — (everything refused) | Path-list (`:`-separated) of library roots. Stream `src`, `Enqueue` input, setup `library_paths` / `archive_path` must lie inside |
+| `TRANSCODER_OUTPUT_DIR` | `<dir of TRANSCODER_DB_PATH>/output` | `Enqueue` `output_path` must lie inside (pipeline outputs are written next to their input) |
+| `TRANSCODER_ALLOW_URL_SOURCES` | off | `1` allows http(s) stream `src` (otherwise refused) |
+| `TRANSCODER_URL_SOURCE_HOSTS` | — | Comma-separated `host:port` allow-list for http(s) `src` (e.g. `media-movies:9430,media-tvshows:9450`); unset = public URLs only (netguard UserURL) |
 | `TRANSCODER_MAX_PLAYBACK` | `4` | Max simultaneous on-the-fly playback transcode sessions |
 | `TRANSCODER_VAAPI_DEVICE` | `/dev/dri/renderD128` | VAAPI render node for hardware playback encode |
 | `TRANSCODER_QSV_DEVICE` | same as VAAPI device | Intel QSV render node (`-init_hw_device qsv=hw@…`) |
 | `TRANSCODER_MAX_CONCURRENT` | `2` | Max simultaneous FFmpeg jobs |
 | `MUXCORE_GRPC_ADDR` | — | Core mesh address (optional) |
 | `MUXCORE_INSECURE_DISABLE_TLS` | `false` | Disable TLS for local/dev mesh |
+
+### Playback HTTP security
+
+- **Mesh TLS (default / household):** the playback API (`/stream/transcode`, `/stream/hls…`, `/stream/trickplay`, `/api/playback/hardware`) is served over TLS with the module's mesh certificate (`MUXCORE_TLS_CERT`/`KEY`). Every request except `GET /healthz` needs a client certificate verified against `MUXCORE_TLS_CA` whose CN is in `TRANSCODER_HTTP_ALLOWED_CALLERS` (401 without a certificate, 403 for another CN). Start fails if the identity or CA is missing.
+- **Dev (`MUXCORE_INSECURE_DISABLE_TLS=true`):** plaintext, bound to `127.0.0.1:9526` by default; a non-loopback bind requires `TRANSCODER_HTTP_TOKEN` (`Authorization: Bearer …`, constant-time compare).
+- **Sources:** `src` must be an absolute path to a regular file inside `TRANSCODER_MEDIA_ROOTS` (symlinks resolved, `..` refused, component-wise prefix match). http(s) sources need `TRANSCODER_ALLOW_URL_SOURCES=1` and pass netguard; ffmpeg runs with `-protocol_whitelist file` (or `file,http,https,tcp,tls` for URL sources). Policy refusals return 403.
+- **gRPC:** served over mesh TLS (`meshtls`); `Enqueue`, `ProcessFile`, `ScanSetups`, `UpsertSetup` and the source disposition (delete / archive) are confined to the roots above and re-checked at use.
 
 Module info: ID `media-transcoder`, version `0.1.1`, capabilities `media.transcoder` / `executor.transcode` / `transcoder`, role `transcoder`, min core `0.4.0`.
 

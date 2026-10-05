@@ -65,9 +65,9 @@ func (m *Module) handleTrickplaySprite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	input, err := resolveStreamInput(r.URL.Query().Get("src"))
+	input, err := m.resolveStreamInput(r.URL.Query().Get("src"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), streamInputStatus(err))
 		return
 	}
 	duration, err := strconv.ParseFloat(strings.TrimSpace(r.URL.Query().Get("duration")), 64)
@@ -139,6 +139,7 @@ func (m *Module) generateTrickplaySprite(input, outPath string, sprite trickplay
 	vf := fmt.Sprintf("fps=1/%.4f,scale=160:-1,tile=%dx%d", sprite.Interval, sprite.Cols, sprite.Rows)
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
+		"-protocol_whitelist", ffmpegProtocolWhitelist(input),
 		"-i", input,
 		"-vf", vf,
 		"-frames:v", "1",

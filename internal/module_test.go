@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,7 +15,11 @@ func newTestModule(t *testing.T) *Module {
 	t.Helper()
 	m := NewModule(Config{
 		DBPath:   filepath.Join(t.TempDir(), "transcoder.db"),
-		GRPCAddr: ":0",
+		GRPCAddr: "127.0.0.1:0",
+		// Tests use t.TempDir() media; the policy is exercised with
+		// narrower roots in source_policy_test.go.
+		MediaRoots: []string{os.TempDir(), "/media", "/data"},
+		OutputDir:  os.TempDir(),
 	})
 	ctx := context.Background()
 	if err := m.Init(ctx); err != nil {
@@ -234,6 +239,8 @@ func TestNVENCPreset(t *testing.T) {
 }
 
 func TestLifecycle(t *testing.T) {
+	t.Setenv("MUXCORE_INSECURE_DISABLE_TLS", "true")
+	t.Setenv("TRANSCODER_HTTP_ADDR", "127.0.0.1:0")
 	m := NewModule(Config{
 		DBPath:   filepath.Join(t.TempDir(), "lifecycle.db"),
 		GRPCAddr: ":0",

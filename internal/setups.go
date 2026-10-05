@@ -140,6 +140,16 @@ func (m *Module) UpsertSetup(ctx context.Context, req *transcodev1.UpsertSetupRe
 	if len(in.GetOutputs()) == 0 {
 		return nil, fmt.Errorf("at least one output profile is required")
 	}
+	// library_paths and archive_path must lie inside TRANSCODER_MEDIA_ROOTS
+	// (re-checked again before any read, delete or rename).
+	libraryPaths, err := m.validateSetupPaths(in)
+	if err != nil {
+		return nil, err
+	}
+	archivePath := strings.TrimSpace(in.GetArchivePath())
+	if archivePath != "" {
+		archivePath = filepath.Clean(archivePath)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -148,7 +158,10 @@ func (m *Module) UpsertSetup(ctx context.Context, req *transcodev1.UpsertSetupRe
 	if id == "" {
 		id = fmt.Sprintf("ts_%d", time.Now().UnixNano())
 	}
-	pathsJSON, _ := json.Marshal(in.GetLibraryPaths())
+	if libraryPaths == nil {
+		libraryPaths = []string{}
+	}
+	pathsJSON, _ := json.Marshal(libraryPaths)
 	trigger := normalizeTrigger(in.GetTrigger())
 	disp := normalizeDisposition(in.GetSourceDisposition())
 
@@ -164,11 +177,11 @@ func (m *Module) UpsertSetup(ctx context.Context, req *transcodev1.UpsertSetupRe
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO transcode_setups (id, name, enabled, library_paths, trigger_mode, source_disposition, archive_path, hold_for_review, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, in.GetName(), boolToInt(in.GetEnabled()), string(pathsJSON), trigger, disp, in.GetArchivePath(), boolToInt(in.GetHoldForReview()), now, now)
+			id, in.GetName(), boolToInt(in.GetEnabled()), string(pathsJSON), trigger, disp, archivePath, boolToInt(in.GetHoldForReview()), now, now)
 	} else {
 		_, err = tx.ExecContext(ctx, `
 			UPDATE transcode_setups SET name=?, enabled=?, library_paths=?, trigger_mode=?, source_disposition=?, archive_path=?, hold_for_review=?, updated_at=? WHERE id=?`,
-			in.GetName(), boolToInt(in.GetEnabled()), string(pathsJSON), trigger, disp, in.GetArchivePath(), boolToInt(in.GetHoldForReview()), now, id)
+			in.GetName(), boolToInt(in.GetEnabled()), string(pathsJSON), trigger, disp, archivePath, boolToInt(in.GetHoldForReview()), now, id)
 	}
 	if err != nil {
 		return nil, err

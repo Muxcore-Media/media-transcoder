@@ -3,6 +3,7 @@ package integsupport
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -18,12 +19,21 @@ type Module = internal.Module
 type Config = internal.Config
 
 // NewTestModule builds and initialises a Module backed by a temp SQLite DB and a
-// loopback gRPC listener (127.0.0.1:0). The playback HTTP server is also bound to
-// loopback unless TRANSCODER_HTTP_ADDR is already set. Stop is registered via t.Cleanup.
+// loopback gRPC listener (127.0.0.1:0). The playback HTTP server is bound to
+// loopback (127.0.0.1:0). Media roots and the Enqueue output dir default to
+// os.TempDir() so t.TempDir() fixtures are accepted. Start serves mesh TLS
+// unless the caller sets MUXCORE_INSECURE_DISABLE_TLS=true. Stop is
+// registered via t.Cleanup.
 func NewTestModule(t *testing.T, cfg Config) *Module {
 	t.Helper()
 	if cfg.DBPath == "" {
 		cfg.DBPath = filepath.Join(t.TempDir(), "transcoder.db")
+	}
+	if len(cfg.MediaRoots) == 0 {
+		cfg.MediaRoots = []string{os.TempDir()}
+	}
+	if cfg.OutputDir == "" {
+		cfg.OutputDir = os.TempDir()
 	}
 	if cfg.GRPCAddr == "" {
 		cfg.GRPCAddr = "127.0.0.1:0"

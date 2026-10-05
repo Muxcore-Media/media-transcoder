@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Muxcore-Media/core/sdk/go/module/pathguard"
+
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 )
 
@@ -19,9 +21,6 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 	input := filepathClean(req.GetInputPath())
 	if setupID == "" || input == "" {
 		return nil, fmt.Errorf("setup_id and input_path are required")
-	}
-	if _, err := os.Stat(input); err != nil {
-		return nil, fmt.Errorf("input not found: %w", err)
 	}
 
 	m.mu.RLock()
@@ -32,6 +31,14 @@ func (m *Module) ProcessFile(ctx context.Context, req *transcodev1.ProcessFileRe
 	}
 	if setup == nil {
 		return nil, fmt.Errorf("setup not found: %s", setupID)
+	}
+	// The input must lie inside the setup's library_paths (themselves
+	// re-checked against TRANSCODER_MEDIA_ROOTS); startPipelineRun confines again.
+	if input, err = m.confineToSetup(input, setup); err != nil {
+		return nil, err
+	}
+	if _, statErr := os.Stat(input); statErr != nil {
+		return nil, fmt.Errorf("input not found: %w", statErr)
 	}
 
 	runID, status, msg, err := m.startPipelineRun(ctx, setup, input)
@@ -77,9 +84,16 @@ func (m *Module) ScanSetups(ctx context.Context, req *transcodev1.ScanSetupsRequ
 		if setup.GetTrigger() == "manual" {
 			continue
 		}
-		roots := setup.GetLibraryPaths()
+		roots := m.setupRoots(setup)
 		if rootOverride != "" {
-			roots = []string{rootOverride}
+			confined, err := m.confineToSetup(rootOverride, setup)
+			if err != nil {
+				if setupID != "" {
+					return nil, err
+				}
+				continue
+			}
+			roots = []string{confined}
 		}
 		for _, root := range roots {
 			root = filepathClean(root)
@@ -196,7 +210,12 @@ func (m *Module) GetPipelineRun(ctx context.Context, req *transcodev1.GetPipelin
 }
 
 func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.TranscodeSetup, inputPath string) (runID, status, msg string, err error) { //nolint:contextcheck // runs are bound to the module lifecycle context
-	inputPath = filepathClean(inputPath)
+	// Every pipeline input (ProcessFile, scans, import events) is confined to
+	// the setup's library roots; the run works on the resolved real path.
+	inputPath, err = m.confineToSetup(inputPath, setup)
+	if err != nil {
+		return "", "", "", err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	runID = fmt.Sprintf("pr_%d", time.Now().UnixNano())
 
@@ -255,6 +274,12 @@ func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *tr
 			m.finishPipelineRun(ctx, runID, "failed", "", "output path equals input path")
 			return
 		}
+		// Suffix and profile container are caller-controlled: the output
+		// must stay next to the (confined) input.
+		if filepath.Dir(outputPath) != filepath.Dir(inputPath) {
+			m.finishPipelineRun(ctx, runID, "failed", "", "output path escapes the input directory")
+			return
+		}
 		outID := fmt.Sprintf("po_%d", time.Now().UnixNano())
 		m.mu.Lock()
 		_, _ = m.db.ExecContext(ctx, `
@@ -262,11 +287,7 @@ func (m *Module) executePipelineRun(ctx context.Context, runID string, setup *tr
 			VALUES (?, ?, ?, ?, 'queued')`, outID, runID, outputPath, out.GetProfileId())
 		m.mu.Unlock()
 
-		resp, err := m.Enqueue(ctx, &transcodev1.EnqueueRequest{
-			InputPath:  inputPath,
-			OutputPath: outputPath,
-			ProfileId:  out.GetProfileId(),
-		})
+		resp, err := m.enqueueConfined(ctx, inputPath, outputPath, out.GetProfileId())
 		if err != nil {
 			m.mu.Lock()
 			_, _ = m.db.ExecContext(ctx, `UPDATE transcode_pipeline_outputs SET status = 'failed', error = ? WHERE id = ?`, err.Error(), outID)
@@ -451,7 +472,7 @@ func (m *Module) remuxContainer(inputPath, container string) error {
 	dir := filepath.Dir(inputPath)
 	base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
 	tmp := filepath.Join(dir, base+".remux."+container)
-	args := []string{"-i", inputPath, "-c", "copy", "-y", tmp}
+	args := []string{"-protocol_whitelist", ffmpegFileProtocols, "-i", inputPath, "-c", "copy", "-y", tmp}
 	cmd := exec.Command(m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("remux: %w: %s", err, strings.TrimSpace(string(out)))
@@ -477,7 +498,7 @@ func (m *Module) probeFile(path string) (*probeInfo, error) {
 		SizeBytes: st.Size(),
 		Extension: ext,
 	}
-	args := []string{"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1", path}
+	args := []string{"-v", "error", "-protocol_whitelist", ffmpegFileProtocols, "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1", path}
 	cmd := exec.Command("ffprobe", args...) //nolint:gosec // ffprobe reads operator-controlled media paths
 	out, err := cmd.Output()
 	if err == nil {
@@ -489,27 +510,38 @@ func (m *Module) probeFile(path string) (*probeInfo, error) {
 	return info, nil
 }
 
+// applySourceDisposition deletes or archives the source. Paths come from the
+// stored run/setup, so both are re-checked against the current roots first:
+// the source entry must be inside the setup's library roots and the archive
+// directory inside TRANSCODER_MEDIA_ROOTS.
 func (m *Module) applySourceDisposition(inputPath string, setup *transcodev1.TranscodeSetup) error {
-	switch normalizeDisposition(setup.GetSourceDisposition()) {
-	case "keep":
-		return nil
-	case "delete":
-		return os.Remove(inputPath)
-	case "archive":
-		archiveDir := filepathClean(setup.GetArchivePath())
-		if archiveDir == "" {
-			return fmt.Errorf("archive_path required for archive disposition")
-		}
-		if err := os.MkdirAll(archiveDir, 0o750); err != nil {
-			return err
-		}
-		dest := filepath.Join(archiveDir, filepath.Base(inputPath))
-		return os.Rename(inputPath, dest)
-	case "replace":
-		return os.Remove(inputPath)
-	default:
+	disp := normalizeDisposition(setup.GetSourceDisposition())
+	if disp != "delete" && disp != "replace" && disp != "archive" {
 		return nil
 	}
+	src, err := confineEntry("source", inputPath, m.setupRoots(setup))
+	if err != nil {
+		return fmt.Errorf("source disposition %s refused: %w", disp, err)
+	}
+	if disp != "archive" {
+		return os.Remove(src)
+	}
+	archiveDir := strings.TrimSpace(setup.GetArchivePath())
+	if archiveDir == "" {
+		return fmt.Errorf("archive_path required for archive disposition")
+	}
+	dir, err := m.confineMedia("archive_path", archiveDir)
+	if err != nil {
+		return fmt.Errorf("source disposition archive refused: %w", err)
+	}
+	if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
+		return mkErr
+	}
+	dest, err := pathguard.Join(dir, filepath.Base(src))
+	if err != nil {
+		return fmt.Errorf("source disposition archive refused: %w", err)
+	}
+	return os.Rename(src, dest)
 }
 
 func computeOutputPath(input string, out *transcodev1.SetupOutput, profile *transcodev1.TranscodeProfile) string {

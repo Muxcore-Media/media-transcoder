@@ -24,6 +24,7 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 	manifest "github.com/Muxcore-Media/media-transcoder"
 	_ "modernc.org/sqlite"
 )
@@ -49,11 +50,15 @@ type Module struct {
 	ffmpegBin     string
 	httpAddr      string
 	hwEncoders    string
+	outputDir     string
+	mediaRoots    []string
+	urlSrcHosts   []string
 	maxConcurrent int
 	mu            sync.RWMutex
 	cfgMu         sync.RWMutex
 	hwOnce        sync.Once
 	bgStopping    bool
+	allowURLSrc   bool
 	pipelineMu    sync.Mutex
 	playbackMu    sync.Mutex
 	jobsMu        sync.Mutex
@@ -73,6 +78,12 @@ type Config struct {
 	DBPath    string
 	GRPCAddr  string
 	FFmpegBin string
+	// OutputDir bounds Enqueue output paths (TRANSCODER_OUTPUT_DIR; default
+	// <dir of DBPath>/output).
+	OutputDir string
+	// MediaRoots bound every media path (TRANSCODER_MEDIA_ROOTS, path-list
+	// separated). Empty refuses every media path.
+	MediaRoots []string
 }
 
 func NewModule(cfg Config) *Module {
@@ -97,6 +108,15 @@ func NewModule(cfg Config) *Module {
 	if v := os.Getenv("TRANSCODER_FFMPEG_BIN"); v != "" {
 		cfg.FFmpegBin = v
 	}
+	if v := strings.TrimSpace(os.Getenv(envMediaRoots)); v != "" {
+		cfg.MediaRoots = parsePathList(v)
+	}
+	if v := strings.TrimSpace(os.Getenv(envOutputDir)); v != "" {
+		cfg.OutputDir = v
+	}
+	if cfg.OutputDir == "" {
+		cfg.OutputDir = filepath.Join(filepath.Dir(cfg.DBPath), "output")
+	}
 	maxConcurrent := 2
 	if v := strings.TrimSpace(os.Getenv("TRANSCODER_MAX_CONCURRENT")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -113,6 +133,10 @@ func NewModule(cfg Config) *Module {
 		grpcAddr:      cfg.GRPCAddr,
 		ffmpegBin:     cfg.FFmpegBin,
 		maxConcurrent: maxConcurrent,
+		mediaRoots:    cfg.MediaRoots,
+		outputDir:     filepath.Clean(cfg.OutputDir),
+		allowURLSrc:   envTruthy(envAllowURLSources),
+		urlSrcHosts:   parseCSV(os.Getenv(envURLSourceHosts)),
 		jobSlots:      slots,
 		jobs:          make(map[string]*jobState),
 		pipelineJobs:  make(map[string]string),
@@ -280,12 +304,25 @@ func (m *Module) Init(ctx context.Context) error {
 	}
 	m.grpcLis = lis
 
-	slog.Info("media-transcoder initialized", "db", m.dbPath, "grpc", m.grpcAddr)
+	if len(m.mediaRoots) == 0 {
+		slog.Warn("media-transcoder: TRANSCODER_MEDIA_ROOTS is not set; every media path (stream src, Enqueue, pipelines) is refused")
+	}
+	slog.Info("media-transcoder initialized", "db", m.dbPath, "grpc", m.grpcAddr,
+		"media_roots", m.mediaRoots, "output_dir", m.outputDir,
+		"url_sources", m.allowURLSrc, "url_source_hosts", m.urlSrcHosts)
 	return nil
 }
 
 func (m *Module) Start(ctx context.Context) error {
-	m.grpcSrv = grpc.NewServer()
+	// gRPC over mesh TLS (ADR-0016/0017); plaintext only with the dev flag.
+	srv, err := meshtls.NewServer()
+	if err != nil {
+		return fmt.Errorf("gRPC TLS: %w", err)
+	}
+	if err := m.startPlaybackHTTP(ctx); err != nil {
+		return err
+	}
+	m.grpcSrv = srv
 	transcodev1.RegisterTranscodeServiceServer(m.grpcSrv, m)
 	modulesdk.RegisterSettings(m.grpcSrv, m.id, m)
 
@@ -306,7 +343,6 @@ func (m *Module) Start(ctx context.Context) error {
 	}) {
 		scanCancel()
 	}
-	m.startPlaybackHTTP()
 	return nil
 }
 
@@ -433,13 +469,37 @@ func (m *Module) DeleteProfile(ctx context.Context, req *transcodev1.DeleteProfi
 
 // ── Job Management ─────────────────────────────────────────────
 
-func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (*transcodev1.EnqueueResponse, error) { //nolint:contextcheck // workers run under the module lifecycle context
+// Enqueue is the gRPC entry point: input_path must be inside
+// TRANSCODER_MEDIA_ROOTS and output_path inside TRANSCODER_OUTPUT_DIR.
+func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (*transcodev1.EnqueueResponse, error) {
 	if req.GetInputPath() == "" || req.GetOutputPath() == "" {
 		return nil, fmt.Errorf("input_path and output_path are required")
 	}
-	if _, err := os.Stat(req.GetInputPath()); os.IsNotExist(err) {
-		return nil, fmt.Errorf("input file not found: %s", req.GetInputPath())
+	input, err := m.confineMedia("input_path", req.GetInputPath())
+	if err != nil {
+		return nil, err
 	}
+	output, err := m.confineOutput(req.GetOutputPath())
+	if err != nil {
+		return nil, err
+	}
+	return m.enqueueConfined(ctx, input, output, req.GetProfileId())
+}
+
+// enqueueConfined queues a job for paths already confined by the caller
+// (Enqueue or the pipeline).
+func (m *Module) enqueueConfined(ctx context.Context, input, output, profileID string) (*transcodev1.EnqueueResponse, error) { //nolint:contextcheck // workers run under the module lifecycle context
+	st, err := os.Stat(input)
+	if err != nil {
+		return nil, fmt.Errorf("input file not found: %s", input)
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("input must be a regular file: %s", input)
+	}
+	if input == output {
+		return nil, fmt.Errorf("output path equals input path")
+	}
+	req := &transcodev1.EnqueueRequest{InputPath: input, OutputPath: output, ProfileId: profileID}
 
 	// Reserve a background slot up front so Stop cannot close the DB between
 	// accepting the job and its worker/poller finishing.

@@ -7,8 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/Muxcore-Media/core/sdk/go/module/meshtls"
 
 	transcoderpoolv1 "github.com/Muxcore-Media/media-transcoder-pool/proto/gen/muxcore/transcoderpool/v1"
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
@@ -45,7 +44,7 @@ func (m *Module) enqueueViaPool(ctx context.Context, req *transcodev1.EnqueueReq
 	if err != nil {
 		return "", err
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := meshtls.Dial(addr)
 	if err != nil {
 		return "", err
 	}
@@ -72,7 +71,7 @@ func (m *Module) waitForPoolJob(ctx context.Context, poolJobID, localJobID strin
 		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := meshtls.Dial(addr)
 	if err != nil {
 		m.markPoolJobFailed(ctx, localJobID, err.Error())
 		return

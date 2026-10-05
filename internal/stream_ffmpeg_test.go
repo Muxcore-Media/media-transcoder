@@ -11,23 +11,6 @@ import (
 	transcodev1 "github.com/Muxcore-Media/media-transcoder/proto/transcodev1"
 )
 
-func TestResolveStreamInput(t *testing.T) {
-	t.Parallel()
-	if _, err := resolveStreamInput(""); err == nil {
-		t.Fatal("expected error for empty src")
-	}
-	if _, err := resolveStreamInput("relative/path.mkv"); err == nil {
-		t.Fatal("expected error for relative path")
-	}
-	got, err := resolveStreamInput("http://127.0.0.1:9430/stream/movies/m1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "http://127.0.0.1:9430/stream/movies/m1" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestBuildPlaybackStreamArgsSoftware(t *testing.T) {
 	m := NewModule(Config{})
 	profile := &transcodev1.TranscodeProfile{

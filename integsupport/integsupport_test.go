@@ -46,6 +46,7 @@ func TestNewTestModule(t *testing.T) {
 }
 
 func TestStartLoopback(t *testing.T) {
+	t.Setenv("MUXCORE_INSECURE_DISABLE_TLS", "true")
 	m := integsupport.NewTestModule(t, integsupport.Config{})
 	t.Setenv("MUXCORE_GRPC_ADDR", "127.0.0.1:1")
 	if err := integsupport.Start(context.Background(), m); err != nil {

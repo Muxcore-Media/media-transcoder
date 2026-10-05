@@ -3,8 +3,10 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,26 +36,8 @@ func (m *Module) ensurePlaybackSlots() {
 	m.playbackSlots = slots
 }
 
-func (m *Module) startPlaybackHTTP() {
-	addr := strings.TrimSpace(os.Getenv("TRANSCODER_HTTP_ADDR"))
-	if addr == "" {
-		addr = ":9526"
-	}
-	maxPlayback := 4
-	if v := strings.TrimSpace(os.Getenv("TRANSCODER_MAX_PLAYBACK")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxPlayback = n
-		}
-	}
-	slots := make(chan struct{}, maxPlayback)
-	for i := 0; i < maxPlayback; i++ {
-		slots <- struct{}{}
-	}
-	m.playbackMu.Lock()
-	m.playbackSlots = slots
-	m.httpAddr = addr
-	m.playbackMu.Unlock()
-
+// playbackMux routes the playback HTTP API (without authentication).
+func (m *Module) playbackMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -64,18 +48,52 @@ func (m *Module) startPlaybackHTTP() {
 	mux.HandleFunc("GET /stream/hls/{key}/{file}", m.handleHLSAsset)
 	mux.HandleFunc("GET /api/playback/hardware", m.handlePlaybackHardware)
 	mux.HandleFunc("GET /stream/trickplay", m.handleTrickplaySprite)
+	return mux
+}
 
-	m.httpSrv = &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
+// startPlaybackHTTP binds the playback HTTP API with caller authentication
+// (see playbackHTTPSecurity). A bind or security misconfiguration fails Start.
+func (m *Module) startPlaybackHTTP(ctx context.Context) error {
+	sec, err := playbackHTTPSecurity()
+	if err != nil {
+		return err
 	}
+	m.ensurePlaybackSlots()
+
+	lc := net.ListenConfig{}
+	lis, err := lc.Listen(ctx, "tcp", sec.addr)
+	if err != nil {
+		return fmt.Errorf("listen playback HTTP %s: %w", sec.addr, err)
+	}
+	srv := &http.Server{
+		Handler:           sec.middleware(m.playbackMux()),
+		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         sec.tls,
+	}
+	m.playbackMu.Lock()
+	m.httpAddr = lis.Addr().String()
+	m.playbackMu.Unlock()
+	m.httpSrv = srv
 	go func() {
-		slog.Info("media-transcoder playback HTTP started", "addr", addr, "max_playback", maxPlayback)
-		if err := m.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("media-transcoder playback HTTP error", "error", err)
+		slog.Info("media-transcoder playback HTTP started", "addr", lis.Addr().String(), "mode", sec.mode())
+		var serveErr error
+		if sec.tls != nil {
+			serveErr = srv.ServeTLS(lis, "", "")
+		} else {
+			serveErr = srv.Serve(lis)
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			slog.Error("media-transcoder playback HTTP error", "error", serveErr)
 		}
 	}()
+	return nil
+}
+
+// PlaybackHTTPAddr returns the bound playback HTTP address after Start.
+func (m *Module) PlaybackHTTPAddr() string {
+	m.playbackMu.Lock()
+	defer m.playbackMu.Unlock()
+	return m.httpAddr
 }
 
 func (m *Module) handlePlaybackHardware(w http.ResponseWriter, r *http.Request) {
@@ -100,9 +118,9 @@ func (m *Module) handlePlaybackStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q, err := parsePlaybackQuery(r)
+	q, err := m.parsePlaybackQuery(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), streamInputStatus(err))
 		return
 	}
 

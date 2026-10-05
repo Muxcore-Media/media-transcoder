@@ -87,13 +87,21 @@ func (m *Module) RejectPipelineRun(ctx context.Context, req *transcodev1.RejectP
 	return &transcodev1.RejectPipelineRunResponse{Run: run}, nil
 }
 
+// removePipelineOutputs deletes a rejected run's outputs. The stored paths
+// are re-checked: only entries inside TRANSCODER_MEDIA_ROOTS or
+// TRANSCODER_OUTPUT_DIR are removed.
 func (m *Module) removePipelineOutputs(run *transcodev1.PipelineRun) error {
+	roots := append(append([]string{}, m.mediaRoots...), m.outputDir)
 	for _, out := range run.GetOutputs() {
 		path := strings.TrimSpace(out.GetOutputPath())
 		if path == "" {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		entry, err := confineEntry("output", path, roots)
+		if err != nil {
+			return fmt.Errorf("remove output refused: %w", err)
+		}
+		if err := os.Remove(entry); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove output %q: %w", path, err)
 		}
 	}
