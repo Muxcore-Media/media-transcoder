@@ -38,7 +38,7 @@ func resolveStreamInput(src string) (string, error) {
 	return src, nil
 }
 
-func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int) []string {
+func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex, subtitleStreamIndex int) []string {
 	encoder := m.pickStreamEncoder(profile, mode)
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	args = append(args, m.hwAccelInputArgs(encoder)...)
@@ -81,7 +81,7 @@ func (m *Module) buildPlaybackEncodeArgs(profile *transcodev1.TranscodeProfile, 
 	return args
 }
 
-func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int) []string {
+func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex, subtitleStreamIndex int) []string {
 	args := m.buildPlaybackEncodeArgs(profile, input, mode, startSeconds, audioStreamIndex, subtitleStreamIndex)
 	return append(args,
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
@@ -90,7 +90,7 @@ func (m *Module) buildPlaybackStreamArgs(profile *transcodev1.TranscodeProfile, 
 	)
 }
 
-func (m *Module) buildHLSStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex int, subtitleStreamIndex int, playlistPath string, segmentPattern string) []string {
+func (m *Module) buildHLSStreamArgs(profile *transcodev1.TranscodeProfile, input string, mode hwBackend, startSeconds float64, audioStreamIndex, subtitleStreamIndex int, playlistPath, segmentPattern string) []string {
 	args := m.buildPlaybackEncodeArgs(profile, input, mode, startSeconds, audioStreamIndex, subtitleStreamIndex)
 	return append(args,
 		"-f", "hls",

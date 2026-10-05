@@ -39,6 +39,7 @@ type Module struct {
 	mc            *client.Client
 	scanCancel    context.CancelFunc
 	grpcSrv       *grpc.Server
+	hlsSessions   map[string]*hlsSession
 	id            string
 	grpcAddr      string
 	dbPath        string
@@ -53,7 +54,6 @@ type Module struct {
 	playbackMu    sync.Mutex
 	jobsMu        sync.Mutex
 	hlsMu         sync.Mutex
-	hlsSessions   map[string]*hlsSession
 }
 
 type jobState struct {

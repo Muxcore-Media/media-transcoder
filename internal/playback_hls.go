@@ -20,14 +20,14 @@ import (
 
 const hlsPlaylistName = "index.m3u8"
 
-var hlsSegmentName = regexp.MustCompile(`^seg_[0-9]+\.ts$`)
+var hlsSegmentName = regexp.MustCompile(`^seg_\d+\.ts$`)
 
 type hlsSession struct {
-	key     string
-	dir     string
+	started chan struct{}
 	cancel  context.CancelFunc
 	err     error
-	started chan struct{}
+	key     string
+	dir     string
 	done    bool
 }
 
@@ -166,7 +166,7 @@ func (m *Module) handleHLSRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "profile not found", http.StatusBadRequest)
 		return
 	}
-	sess, err := m.ensureHLSSession(profile, q)
+	sess, err := m.ensureHLSSession(r.Context(), profile, q)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -194,7 +194,7 @@ func (m *Module) handleHLSAsset(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
-		http.ServeFile(w, r, path)
+		http.ServeFile(w, r, path) //nolint:gosec // path is built from a hex-validated key and an allow-listed file name (validHLSKey/validHLSFile)
 		return
 	}
 	if err := waitForFile(r.Context(), path, 20*time.Second); err != nil {
@@ -203,7 +203,7 @@ func (m *Module) handleHLSAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	http.ServeFile(w, r, path)
+	http.ServeFile(w, r, path) //nolint:gosec // path is built from a hex-validated key and an allow-listed file name (validHLSKey/validHLSFile)
 }
 
 func waitForFile(ctx context.Context, path string, timeout time.Duration) error {
@@ -211,7 +211,7 @@ func waitForFile(ctx context.Context, path string, timeout time.Duration) error 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+		if st, err := os.Stat(path); err == nil && st.Size() > 0 { //nolint:gosec // callers pass paths under the HLS cache built from validated key/file names
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -229,7 +229,7 @@ func waitForPlaylist(ctx context.Context, dir string, timeout time.Duration) err
 	return waitForFile(ctx, playlistPath(dir), timeout)
 }
 
-func (m *Module) ensureHLSSession(profile *transcodev1.TranscodeProfile, q playbackQuery) (*hlsSession, error) {
+func (m *Module) ensureHLSSession(ctx context.Context, profile *transcodev1.TranscodeProfile, q playbackQuery) (*hlsSession, error) {
 	key := hlsSessionKey(q.input, q.profileID, q.encoderMode, q.maxHeight, q.audioIndex, q.subtitleIndex, hlsStartBucket(q.startSeconds))
 	dir := filepath.Join(m.hlsCacheDir(), key)
 
@@ -256,7 +256,7 @@ func (m *Module) ensureHLSSession(profile *transcodev1.TranscodeProfile, q playb
 	m.hlsSessions[key] = sess
 	m.hlsMu.Unlock()
 
-	if err := m.startHLSFFmpeg(sess, profile, q); err != nil {
+	if err := m.startHLSFFmpeg(ctx, sess, profile, q); err != nil {
 		sess.err = err
 		close(sess.started)
 		m.hlsMu.Lock()
@@ -268,7 +268,7 @@ func (m *Module) ensureHLSSession(profile *transcodev1.TranscodeProfile, q playb
 	return sess, nil
 }
 
-func (m *Module) startHLSFFmpeg(sess *hlsSession, profile *transcodev1.TranscodeProfile, q playbackQuery) error {
+func (m *Module) startHLSFFmpeg(ctx context.Context, sess *hlsSession, profile *transcodev1.TranscodeProfile, q playbackQuery) error {
 	if err := os.MkdirAll(sess.dir, 0o700); err != nil {
 		return fmt.Errorf("hls cache: %w", err)
 	}
@@ -279,10 +279,12 @@ func (m *Module) startHLSFFmpeg(sess *hlsSession, profile *transcodev1.Transcode
 		return fmt.Errorf("playback capacity busy")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// The ffmpeg process outlives the request that started it, so detach from
+	// the request's cancellation while keeping its values.
+	procCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	sess.cancel = cancel
 	args := m.buildHLSStreamArgs(profile, q.input, q.encoderMode, q.startSeconds, q.audioIndex, q.subtitleIndex, playlistPath(sess.dir), filepath.Join(sess.dir, "seg_%05d.ts"))
-	cmd := exec.CommandContext(ctx, m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
+	cmd := exec.CommandContext(procCtx, m.getFFmpegBin(), args...) //nolint:gosec // ffmpeg paths come from operator-controlled media library
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
