@@ -54,6 +54,7 @@ type Module struct {
 	playbackMu    sync.Mutex
 	jobsMu        sync.Mutex
 	hlsMu         sync.Mutex
+	jobWG         sync.WaitGroup
 }
 
 type jobState struct {
@@ -112,6 +113,15 @@ func NewModule(cfg Config) *Module {
 		pipelineJobs:  make(map[string]string),
 		hlsSessions:   make(map[string]*hlsSession),
 	}
+}
+
+// GRPCListenAddr returns the bound gRPC listen address after Init, or the
+// configured address when no listener exists yet.
+func (m *Module) GRPCListenAddr() string {
+	if m.grpcLis != nil {
+		return m.grpcLis.Addr().String()
+	}
+	return m.grpcAddr
 }
 
 func (m *Module) Info() contracts.ModuleInfo {
@@ -257,11 +267,21 @@ func (m *Module) Stop(ctx context.Context) error {
 	}
 	m.jobsMu.Unlock()
 
+	// Let cancelled local workers finish before the DB is closed under them.
+	jobsDone := make(chan struct{})
+	go func() { m.jobWG.Wait(); close(jobsDone) }()
+	select {
+	case <-jobsDone:
+	case <-ctx.Done():
+	}
+
 	if m.httpSrv != nil {
 		_ = m.httpSrv.Shutdown(ctx)
 	}
 	if m.grpcSrv != nil {
 		m.grpcSrv.GracefulStop()
+	} else if m.grpcLis != nil {
+		_ = m.grpcLis.Close() // Init ran but Start never served the listener
 	}
 	if m.mc != nil {
 		_ = m.mc.Close()
@@ -386,19 +406,27 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 		}
 		slog.Warn("pool enqueue failed, falling back to local worker", "error", poolErr)
 	}
-	go m.runJob(ctx, id, profile) //nolint:gosec // transcode worker outlives enqueue RPC
+	m.jobWG.Add(1)
+	go func() { //nolint:gosec // transcode worker outlives enqueue RPC
+		defer m.jobWG.Done()
+		m.runJob(ctx, id, profile)
+	}()
 	return &transcodev1.EnqueueResponse{JobId: id}, nil
 }
 
 func (m *Module) CancelJob(ctx context.Context, req *transcodev1.CancelJobRequest) (*transcodev1.CancelJobResponse, error) {
 	m.jobsMu.Lock()
 	js, ok := m.jobs[req.GetJobId()]
+	var cancel context.CancelFunc
+	if ok {
+		cancel = js.cancel
+	}
 	m.jobsMu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
 	}
-	if js.cancel != nil {
-		js.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	m.mu.Lock()
 	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'cancelled', updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), req.GetJobId())
@@ -420,7 +448,7 @@ func (m *Module) ListJobs(ctx context.Context, req *transcodev1.ListJobsRequest)
 	}
 	offset := (page - 1) * pageSize
 
-	query := `SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, error, started_at, completed_at, created_at, updated_at FROM transcode_jobs`
+	query := `SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, COALESCE(error, ''), COALESCE(started_at, ''), COALESCE(completed_at, ''), created_at, updated_at FROM transcode_jobs`
 	countQuery := `SELECT COUNT(*) FROM transcode_jobs`
 	var args []any
 	var where []string
@@ -466,7 +494,7 @@ func (m *Module) GetJob(ctx context.Context, req *transcodev1.GetJobRequest) (*t
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	row := m.db.QueryRowContext(ctx, `SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, error, started_at, completed_at, created_at, updated_at FROM transcode_jobs WHERE id = ?`, req.GetJobId())
+	row := m.db.QueryRowContext(ctx, `SELECT id, input_path, output_path, profile_id, profile_name, status, progress, fps, COALESCE(error, ''), COALESCE(started_at, ''), COALESCE(completed_at, ''), created_at, updated_at FROM transcode_jobs WHERE id = ?`, req.GetJobId())
 	job := scanJobRow(row)
 	if job == nil {
 		return nil, fmt.Errorf("job not found: %s", req.GetJobId())
@@ -506,14 +534,16 @@ func (m *Module) runJob(ctx context.Context, jobID string, profile *transcodev1.
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	m.jobsMu.Lock()
 	js.cancel = cancel
 	js.running = true
+	m.jobsMu.Unlock()
 	js.info.Status = "running"
 	now := time.Now().UTC().Format(time.RFC3339)
 	js.info.StartedAt = now
 
 	m.mu.Lock()
-	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?`, now, now, jobID)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'running', started_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'`, now, now, jobID)
 	m.mu.Unlock()
 
 	args := m.buildFFmpegArgs(profile, js.info.InputPath, js.info.OutputPath)
@@ -585,7 +615,7 @@ func (m *Module) failJob(ctx context.Context, js *jobState, errMsg string) {
 	js.running = false
 
 	m.mu.Lock()
-	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ?`, errMsg, now, now, js.info.Id)
+	_, _ = m.db.ExecContext(ctx, `UPDATE transcode_jobs SET status = 'failed', error = ?, completed_at = ?, updated_at = ? WHERE id = ? AND status != 'cancelled'`, errMsg, now, now, js.info.Id)
 	m.mu.Unlock()
 
 	slog.Error("transcode failed", "job", js.info.Id, "error", errMsg)

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.7] - 2026-10-05
+
+
+### Added
+- `integsupport` package exposing `Module`, `Config`, `NewTestModule`, and `Start` so the umbrella integration tests can drive the transcoder in-process (loopback listeners, temp SQLite DB, offline).
+
+### Fixed
+- `GetJob`/`ListJobs` no longer drop jobs whose `started_at`/`completed_at` are NULL (queued jobs).
+- A cancelled job is no longer overwritten with `running`/`failed` by a racing worker; `Stop` waits for local workers before closing the DB and closes an Init-only gRPC listener.
+
 ## [0.3.5] - 2026-10-05
 
 ### Changed
