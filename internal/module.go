@@ -24,6 +24,7 @@ import (
 	"github.com/Muxcore-Media/core/pkg/contracts"
 	"github.com/Muxcore-Media/core/sdk/go/client"
 	modulesdk "github.com/Muxcore-Media/core/sdk/go/module"
+	manifest "github.com/Muxcore-Media/media-transcoder"
 	_ "modernc.org/sqlite"
 )
 
@@ -176,7 +177,7 @@ func (m *Module) Info() contracts.ModuleInfo {
 	return contracts.ModuleInfo{
 		ID:             m.id,
 		Name:           "Media Transcoder",
-		Version:        "0.3.5",
+		Version:        modulesdk.ManifestVersion(manifest.ManifestJSON),
 		Roles:          []string{"transcoder"},
 		Description:    "Video transcoding via FFmpeg with Tdarr-style configurable setups, multi-output pipelines, and job queue",
 		Author:         "MuxCore",
