@@ -151,13 +151,24 @@ func (m *Module) ListPipelineRuns(ctx context.Context, req *transcodev1.ListPipe
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	var runs []*transcodev1.PipelineRun
+	// Drain and close the outer rows before running per-run queries: the SQLite
+	// pool has a single connection, so a nested query would block forever.
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
+		ids = append(ids, id)
+	}
+	iterErr := rows.Err()
+	_ = rows.Close()
+	if iterErr != nil {
+		return nil, iterErr
+	}
+	var runs []*transcodev1.PipelineRun
+	for _, id := range ids {
 		run, err := m.loadPipelineRun(ctx, id)
 		if err != nil {
 			return nil, err
@@ -184,11 +195,15 @@ func (m *Module) GetPipelineRun(ctx context.Context, req *transcodev1.GetPipelin
 	return &transcodev1.GetPipelineRunResponse{Run: run}, nil
 }
 
-func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.TranscodeSetup, inputPath string) (runID, status, msg string, err error) {
+func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.TranscodeSetup, inputPath string) (runID, status, msg string, err error) { //nolint:contextcheck // runs are bound to the module lifecycle context
 	inputPath = filepathClean(inputPath)
 	now := time.Now().UTC().Format(time.RFC3339)
 	runID = fmt.Sprintf("pr_%d", time.Now().UnixNano())
 
+	bgCtx, ok := m.bgAcquire()
+	if !ok {
+		return "", "", "", fmt.Errorf("module is stopping")
+	}
 	m.mu.Lock()
 	_, err = m.db.ExecContext(ctx, `
 		INSERT INTO transcode_pipeline_runs (id, setup_id, setup_name, input_path, status, source_disposition, created_at, updated_at)
@@ -196,10 +211,16 @@ func (m *Module) startPipelineRun(ctx context.Context, setup *transcodev1.Transc
 		runID, setup.GetId(), setup.GetName(), inputPath, setup.GetSourceDisposition(), now, now)
 	m.mu.Unlock()
 	if err != nil {
+		m.bgRelease()
 		return "", "", "", err
 	}
 
-	go m.executePipelineRun(ctx, runID, setup, inputPath)
+	// The run outlives the triggering RPC/event, so it is bound to the module
+	// lifecycle (cancelled and awaited by Stop), not the caller's context.
+	go func() {
+		defer m.bgRelease()
+		m.executePipelineRun(bgCtx, runID, setup, inputPath)
+	}()
 	return runID, "queued", "pipeline started", nil
 }
 
@@ -308,7 +329,9 @@ func (m *Module) waitForJobsAndFinalize(ctx context.Context, runID string, setup
 			m.finishPipelineRun(ctx, runID, "completed", "", "")
 			return
 		}
-		time.Sleep(2 * time.Second)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return // module stopping; the run stays 'running' and no DB access follows
+		}
 	}
 	m.finishPipelineRun(ctx, runID, "failed", "", "timed out waiting for transcode jobs")
 }

@@ -106,7 +106,9 @@ func (m *Module) waitForPoolJob(ctx context.Context, poolJobID, localJobID strin
 		case "running", "assigned":
 			m.markPoolJobProgress(ctx, localJobID, 0.5)
 		}
-		time.Sleep(2 * time.Second)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return // module stopping; leave the job row for the next start
+		}
 	}
 	m.markPoolJobFailed(ctx, localJobID, "timed out waiting for pool job")
 }

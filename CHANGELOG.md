@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.8] - 2026-10-05
+
+
+### Fixed
+- `ListPipelineRuns` no longer deadlocks: it ran a per-run query while its outer result set was still open, which blocks forever on the single-connection SQLite pool. Outer rows are now drained and closed first (no other nested-query-while-rows-open sites exist).
+- Every background goroutine is now bound to the module lifecycle: pipeline-run executors/finalizers (the 2s job poller), pool-job pollers, job workers, core dial, event-stream handlers and the scheduled scan loop run under a context cancelled by `Stop`, and `Stop` waits for them (bounded by its ctx) before closing the DB. Previously the pipeline poller kept running after `Stop` closed the DB and panicked on a nil DB. New background work is refused once `Stop` begins; if the `Stop` deadline expires with goroutines still running, the DB is left open rather than closed under them.
+- Pipeline runs, pool pollers and local job workers no longer inherit the (short-lived) RPC context; they run under the module lifecycle context.
+
 ## [0.3.7] - 2026-10-05
 
 

@@ -49,14 +49,27 @@ func (m *Module) subscribeLibraryEvents(ctx context.Context) {
 			slog.Warn("media-transcoder: subscribe", "type", et, "error", err)
 			continue
 		}
-		go m.handleEventStream(ctx, et, ch, cancel)
+		if !m.goBG(func(bg context.Context) { m.handleEventStream(bg, et, ch, cancel) }) { //nolint:contextcheck // lifecycle goroutine
+			cancel()
+			return
+		}
 		slog.Info("media-transcoder: subscribed", "type", et)
 	}
 }
 
 func (m *Module) handleEventStream(ctx context.Context, eventType string, ch <-chan *eventsv1.Event, cancel context.CancelFunc) {
 	defer cancel()
-	for evt := range ch {
+	for {
+		var evt *eventsv1.Event
+		select {
+		case <-ctx.Done():
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			evt = e
+		}
 		path := eventFilePath(eventType, evt.GetPayload())
 		if path == "" {
 			continue

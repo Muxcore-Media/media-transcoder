@@ -29,6 +29,7 @@ import (
 
 type Module struct {
 	transcodev1.UnimplementedTranscodeServiceServer
+	bgCtx         context.Context //nolint:containedctx // module lifecycle context, cancelled by Stop
 	grpcLis       net.Listener
 	jobs          map[string]*jobState
 	httpSrv       *http.Server
@@ -38,6 +39,7 @@ type Module struct {
 	pipelineJobs  map[string]string
 	mc            *client.Client
 	scanCancel    context.CancelFunc
+	bgCancel      context.CancelFunc
 	grpcSrv       *grpc.Server
 	hlsSessions   map[string]*hlsSession
 	id            string
@@ -50,11 +52,13 @@ type Module struct {
 	mu            sync.RWMutex
 	cfgMu         sync.RWMutex
 	hwOnce        sync.Once
+	bgStopping    bool
 	pipelineMu    sync.Mutex
 	playbackMu    sync.Mutex
 	jobsMu        sync.Mutex
 	hlsMu         sync.Mutex
-	jobWG         sync.WaitGroup
+	bgMu          sync.Mutex
+	jobWG         sync.WaitGroup // tracks every background goroutine (job workers, pipeline runs, pollers, event handlers)
 }
 
 type jobState struct {
@@ -112,6 +116,50 @@ func NewModule(cfg Config) *Module {
 		jobs:          make(map[string]*jobState),
 		pipelineJobs:  make(map[string]string),
 		hlsSessions:   make(map[string]*hlsSession),
+	}
+}
+
+// bgAcquire reserves a slot for a background goroutine and returns the module
+// lifecycle context it must run under. It returns false once Stop has begun.
+// Every successful call must be paired with exactly one bgRelease.
+func (m *Module) bgAcquire() (context.Context, bool) {
+	m.bgMu.Lock()
+	defer m.bgMu.Unlock()
+	if m.bgStopping {
+		return nil, false
+	}
+	if m.bgCtx == nil {
+		m.bgCtx, m.bgCancel = context.WithCancel(context.Background())
+	}
+	m.jobWG.Add(1)
+	return m.bgCtx, true
+}
+
+func (m *Module) bgRelease() { m.jobWG.Done() }
+
+// goBG runs fn on a tracked background goroutine bound to the module lifecycle
+// context. It reports false (and does not run fn) when the module is stopping.
+func (m *Module) goBG(fn func(ctx context.Context)) bool {
+	ctx, ok := m.bgAcquire()
+	if !ok {
+		return false
+	}
+	go func() {
+		defer m.bgRelease()
+		fn(ctx)
+	}()
+	return true
+}
+
+// sleepCtx waits for d or ctx cancellation; it reports whether the full wait elapsed.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -246,16 +294,30 @@ func (m *Module) Start(ctx context.Context) error {
 			slog.Error("media-transcoder gRPC error", "error", err)
 		}
 	}()
-	go m.dialCore(context.Background()) //nolint:gosec // module lifecycle goroutine outlives request context
+	m.goBG(m.dialCore) //nolint:contextcheck // lifecycle goroutine is bound to the module context, not Start ctx
 	scanCtx, scanCancel := context.WithCancel(ctx)
 	m.scanCancel = scanCancel
-	go m.scheduledScanLoop(scanCtx)
+	if !m.goBG(func(bg context.Context) { //nolint:contextcheck // lifecycle goroutine
+		// Stop cancels bg; scanCancel also lets the caller's Start ctx end the loop.
+		stop := context.AfterFunc(bg, scanCancel)
+		defer stop()
+		m.scheduledScanLoop(scanCtx)
+	}) {
+		scanCancel()
+	}
 	m.startPlaybackHTTP()
 	return nil
 }
 
 func (m *Module) Stop(ctx context.Context) error {
 	m.stopHLSSessions()
+	// Refuse new background work, then cancel everything already running.
+	m.bgMu.Lock()
+	m.bgStopping = true
+	if m.bgCancel != nil {
+		m.bgCancel()
+	}
+	m.bgMu.Unlock()
 	if m.scanCancel != nil {
 		m.scanCancel()
 	}
@@ -267,12 +329,16 @@ func (m *Module) Stop(ctx context.Context) error {
 	}
 	m.jobsMu.Unlock()
 
-	// Let cancelled local workers finish before the DB is closed under them.
-	jobsDone := make(chan struct{})
-	go func() { m.jobWG.Wait(); close(jobsDone) }()
+	// Let every cancelled background goroutine (job workers, pipeline runs,
+	// pollers, event handlers) finish before the DB is closed under them.
+	bgDone := make(chan struct{})
+	go func() { m.jobWG.Wait(); close(bgDone) }()
+	drained := true
 	select {
-	case <-jobsDone:
+	case <-bgDone:
 	case <-ctx.Done():
+		drained = false
+		slog.Warn("media-transcoder stop: background goroutines still running at deadline; leaving DB open")
 	}
 
 	if m.httpSrv != nil {
@@ -286,12 +352,14 @@ func (m *Module) Stop(ctx context.Context) error {
 	if m.mc != nil {
 		_ = m.mc.Close()
 	}
-	m.mu.Lock()
-	if m.db != nil {
-		_ = m.db.Close()
-		m.db = nil
+	if drained {
+		m.mu.Lock()
+		if m.db != nil {
+			_ = m.db.Close()
+			m.db = nil
+		}
+		m.mu.Unlock()
 	}
-	m.mu.Unlock()
 	slog.Info("media-transcoder stopped")
 	return nil
 }
@@ -364,13 +432,26 @@ func (m *Module) DeleteProfile(ctx context.Context, req *transcodev1.DeleteProfi
 
 // ── Job Management ─────────────────────────────────────────────
 
-func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (*transcodev1.EnqueueResponse, error) {
+func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (*transcodev1.EnqueueResponse, error) { //nolint:contextcheck // workers run under the module lifecycle context
 	if req.GetInputPath() == "" || req.GetOutputPath() == "" {
 		return nil, fmt.Errorf("input_path and output_path are required")
 	}
 	if _, err := os.Stat(req.GetInputPath()); os.IsNotExist(err) {
 		return nil, fmt.Errorf("input file not found: %s", req.GetInputPath())
 	}
+
+	// Reserve a background slot up front so Stop cannot close the DB between
+	// accepting the job and its worker/poller finishing.
+	bgCtx, ok := m.bgAcquire()
+	if !ok {
+		return nil, fmt.Errorf("module is stopping")
+	}
+	release := true
+	defer func() {
+		if release {
+			m.bgRelease()
+		}
+	}()
 
 	m.mu.RLock()
 	profile := m.loadProfile(ctx, req.GetProfileId())
@@ -399,17 +480,21 @@ func (m *Module) Enqueue(ctx context.Context, req *transcodev1.EnqueueRequest) (
 	m.jobsMu.Unlock()
 
 	if m.poolEnabled() {
-		poolJobID, poolErr := m.enqueueViaPool(context.Background(), req, profile)
+		poolJobID, poolErr := m.enqueueViaPool(bgCtx, req, profile) //nolint:contextcheck // lifecycle ctx
 		if poolErr == nil {
-			go m.waitForPoolJob(ctx, poolJobID, id)
+			release = false // slot handed to the poller
+			go func() {
+				defer m.bgRelease()
+				m.waitForPoolJob(bgCtx, poolJobID, id)
+			}()
 			return &transcodev1.EnqueueResponse{JobId: id}, nil
 		}
 		slog.Warn("pool enqueue failed, falling back to local worker", "error", poolErr)
 	}
-	m.jobWG.Add(1)
-	go func() { //nolint:gosec // transcode worker outlives enqueue RPC
-		defer m.jobWG.Done()
-		m.runJob(ctx, id, profile)
+	release = false // slot handed to the local worker
+	go func() {     //nolint:gosec // transcode worker outlives enqueue RPC
+		defer m.bgRelease()
+		m.runJob(bgCtx, id, profile)
 	}()
 	return &transcodev1.EnqueueResponse{JobId: id}, nil
 }
@@ -515,6 +600,8 @@ func (m *Module) DetectHardware(ctx context.Context, req *transcodev1.DetectHard
 func (m *Module) runJob(ctx context.Context, jobID string, profile *transcodev1.TranscodeProfile) {
 	select {
 	case <-m.jobSlots:
+	case <-ctx.Done():
+		return // module stopping
 	case <-time.After(24 * time.Hour):
 		m.jobsMu.Lock()
 		js := m.jobs[jobID]
